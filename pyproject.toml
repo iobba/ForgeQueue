@@ -1,0 +1,72 @@
+[project]
+name = "forgequeue"
+version = "0.1.0"
+description = "A distributed background-job processing platform built from first principles."
+authors = [
+    { name = "iobba", email = "125093290+iobba@users.noreply.github.com" }
+]
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    "alembic>=1.19.1",
+    "fastapi>=0.141.1",
+    "psycopg[binary]>=3.3.4",
+    "pydantic-settings>=2.15.0",
+    "redis>=8.1.0",
+    "sqlalchemy[asyncio]>=2.0.52",
+    "structlog>=26.1.0",
+    "uvicorn[standard]>=0.52.3",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "httpx2>=2.10.0",
+    "pyright>=1.1.411",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.3",
+]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 88
+src = ["src"]
+
+[tool.ruff.lint]
+select = [
+    "ASYNC", # Async-code problems
+    "B",     # Common bugs and design problems
+    "E",     # Python style errors
+    "F",     # Invalid or unused Python code
+    "I",     # Import ordering
+    "RUF",   # Ruff-specific correctness rules
+    "UP",    # Modern Python syntax
+]
+ignore = [
+    "E501",  # Let the formatter handle line length
+]
+
+[tool.pyright]
+include = [
+    "src",
+    "alembic",
+    "tests",
+]
+extraPaths = ["src"]
+pythonVersion = "3.14"
+typeCheckingMode = "strict"
+
+[tool.pytest.ini_options]
+markers = [
+    "unit: tests isolated from external services",
+    "integration: tests that require real infrastructure",
+]
+minversion = "9.0"
+testpaths = ["tests"]
+strict = true
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+asyncio_default_test_loop_scope = "function"
