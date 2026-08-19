@@ -7,7 +7,7 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from forgequeue.core.config import get_settings
-from forgequeue.db.base import Base
+from forgequeue.db.models import Job
 from forgequeue.db.session import build_database_url
 
 # this is the Alembic Config object, which provides
@@ -26,7 +26,7 @@ if config.config_file_name is not None:
 settings = get_settings()
 database_url = build_database_url(settings)
 
-target_metadata = Base.metadata
+target_metadata = Job.metadata
 # other values from the config, defined by the needs of env.py,
 # can be acquired:
 # my_important_option = config.get_main_option("my_important_option")

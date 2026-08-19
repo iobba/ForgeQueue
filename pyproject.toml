@@ -2,6 +2,7 @@
 name = "forgequeue"
 version = "0.1.0"
 description = "A distributed background-job processing platform built from first principles."
+readme = "README.md"
 authors = [
     { name = "iobba", email = "125093290+iobba@users.noreply.github.com" }
 ]
@@ -60,6 +61,7 @@ pythonVersion = "3.14"
 typeCheckingMode = "strict"
 
 [tool.pytest.ini_options]
+addopts = "--import-mode=importlib"
 markers = [
     "unit: tests isolated from external services",
     "integration: tests that require real infrastructure",

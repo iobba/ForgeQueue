@@ -2,6 +2,7 @@
 
 COMPOSE := docker compose
 UV := uv
+TEST_DATABASE := forgequeue_test
 
 .PHONY: help \
 	compose-config \
@@ -14,6 +15,9 @@ UV := uv
 	postgres-logs \
 	redis-logs \
 	infra-check \
+	test-db-create \
+	test-db-upgrade \
+	test-db-setup \
 	format \
 	format-check \
 	lint \
@@ -38,6 +42,9 @@ help:
 	@echo "  make postgres-logs            Follow PostgreSQL logs"
 	@echo "  make redis-logs               Follow Redis logs"
 	@echo "  make infra-check              Verify PostgreSQL and Redis readiness"
+	@echo "  make test-db-create           Create the test database when missing"
+	@echo "  make test-db-upgrade          Apply migrations to the test database"
+	@echo "  make test-db-setup            Start infrastructure and prepare the test database"
 	@echo "  make format                   Format Python files"
 	@echo "  make format-check             Verify Python formatting"
 	@echo "  make lint                     Run Ruff lint checks"
@@ -85,6 +92,24 @@ redis-logs:
 infra-check:
 	$(COMPOSE) exec postgres sh -c 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"'
 	$(COMPOSE) exec redis redis-cli ping
+
+test-db-create:
+	@database_names="$$( $(COMPOSE) exec -T postgres sh -c \
+		'psql -U "$$POSTGRES_USER" -d postgres -tAc "SELECT datname FROM pg_database"' )" || exit $$?; \
+	if printf '%s\n' "$$database_names" | grep -Fxq "$(TEST_DATABASE)"; then \
+		echo "Database $(TEST_DATABASE) already exists"; \
+	else \
+		$(COMPOSE) exec -T postgres sh -c \
+			'createdb -U "$$POSTGRES_USER" "$(TEST_DATABASE)"'; \
+		echo "Created database $(TEST_DATABASE)"; \
+	fi
+
+test-db-upgrade:
+	POSTGRES_DB=$(TEST_DATABASE) $(UV) run alembic upgrade head
+
+test-db-setup: infra-up
+	$(MAKE) test-db-create
+	$(MAKE) test-db-upgrade
 
 format:
 	$(UV) run ruff format .
