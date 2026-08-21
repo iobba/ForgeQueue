@@ -45,7 +45,6 @@ Redis Streams --> Workers --> PostgreSQL
 | V3 | Transactional outbox, scheduling, priorities, cancellation, and rate limiting | Planned |
 | V4 | CI/CD, metrics, dashboards, tracing, load testing, and production hardening | Planned |
 
-Current milestone: **V1.2 — Submission and query API**.
 
 ## Technology stack
 

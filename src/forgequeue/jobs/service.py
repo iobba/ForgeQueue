@@ -29,6 +29,29 @@ class JobService:
             max_attempts=max_attempts,
         )
 
+    async def get_job(self, job_id: UUID) -> Job:
+        job = await self._repository.get(job_id=job_id)
+        if job is None:
+            raise JobNotFoundError(job_id=job_id)
+
+        return job
+
+    async def list_jobs(
+        self,
+        *,
+        status: JobStatus | None = None,
+        page: int = 1,
+        limit: int = 100,
+    ) -> tuple[list[Job], int]:
+        offset = (page - 1) * limit
+        jobs = await self._repository.list_jobs(
+            status=status,
+            limit=limit,
+            offset=offset,
+        )
+        total = await self._repository.count_jobs(status=status)
+        return jobs, total
+
     async def start_job(self, job_id: UUID) -> Job:
         job = await self._repository.get(job_id=job_id)
         if job is None:

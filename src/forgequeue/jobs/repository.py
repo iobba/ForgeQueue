@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from forgequeue.db.models import Job
@@ -45,3 +45,15 @@ class JobRepository:
         jobs = await self._session.scalars(query)
 
         return list(jobs)
+
+    async def count_jobs(
+        self,
+        *,
+        status: JobStatus | None = None,
+    ) -> int:
+        query = select(func.count()).select_from(Job)
+        if status is not None:
+            query = query.where(Job.status == status)
+
+        count = await self._session.scalar(query)
+        return count or 0

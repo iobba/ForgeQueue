@@ -19,6 +19,10 @@ class FakeJobRepository(JobRepository):
         self.job = job
         self.requested_job_id: UUID | None = None
         self.create_call: tuple[str, dict[str, object], int] | None = None
+        self.list_result: list[Job] = [] if job is None else [job]
+        self.list_call: tuple[JobStatus | None, int, int] | None = None
+        self.count_result = len(self.list_result)
+        self.count_status: JobStatus | None = None
 
     async def create(
         self,
@@ -37,6 +41,24 @@ class FakeJobRepository(JobRepository):
     async def get(self, job_id: UUID) -> Job | None:
         self.requested_job_id = job_id
         return self.job
+
+    async def list_jobs(
+        self,
+        *,
+        status: JobStatus | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[Job]:
+        self.list_call = (status, limit, offset)
+        return self.list_result
+
+    async def count_jobs(
+        self,
+        *,
+        status: JobStatus | None = None,
+    ) -> int:
+        self.count_status = status
+        return self.count_result
 
 
 def make_job(status: JobStatus) -> Job:
@@ -64,6 +86,49 @@ async def test_create_job_delegates_to_repository() -> None:
 
     assert created_job is job
     assert repository.create_call == ("generate_report", payload, 5)
+
+
+async def test_get_job_returns_existing_job() -> None:
+    job = make_job(JobStatus.QUEUED)
+    repository = FakeJobRepository(job)
+    service = JobService(repository)
+
+    returned_job = await service.get_job(job.id)
+
+    assert returned_job is job
+    assert repository.requested_job_id == job.id
+
+
+async def test_get_job_raises_when_job_is_missing() -> None:
+    repository = FakeJobRepository(None)
+    service = JobService(repository)
+    job_id = uuid7()
+
+    with pytest.raises(JobNotFoundError) as exc_info:
+        await service.get_job(job_id)
+
+    assert exc_info.value.job_id == job_id
+    assert repository.requested_job_id == job_id
+
+
+async def test_list_jobs_delegates_filter_and_converts_page_to_offset() -> None:
+    first_job = make_job(JobStatus.RUNNING)
+    second_job = make_job(JobStatus.RUNNING)
+    repository = FakeJobRepository(first_job)
+    repository.list_result = [first_job, second_job]
+    repository.count_result = 52
+    service = JobService(repository)
+
+    jobs, total = await service.list_jobs(
+        status=JobStatus.RUNNING,
+        page=3,
+        limit=25,
+    )
+
+    assert jobs == [first_job, second_job]
+    assert total == 52
+    assert repository.list_call == (JobStatus.RUNNING, 25, 50)
+    assert repository.count_status is JobStatus.RUNNING
 
 
 async def test_start_job_moves_queued_job_to_running() -> None:

@@ -155,3 +155,19 @@ async def test_list_jobs_applies_limit_and_offset(
         created_jobs[2].id,
         created_jobs[1].id,
     ]
+
+
+async def test_count_jobs_counts_all_jobs_and_applies_status_filter(
+    database_session: AsyncSession,
+) -> None:
+    repository = JobRepository(database_session)
+    initial_total = await repository.count_jobs()
+    initial_running = await repository.count_jobs(status=JobStatus.RUNNING)
+    queued_job = await repository.create(job_type="queued", payload={})
+    running_job = await repository.create(job_type="running", payload={})
+    running_job.status = JobStatus.RUNNING
+    await database_session.flush()
+
+    assert await repository.count_jobs() == initial_total + 2
+    assert await repository.count_jobs(status=JobStatus.RUNNING) == initial_running + 1
+    assert queued_job.status is JobStatus.QUEUED
