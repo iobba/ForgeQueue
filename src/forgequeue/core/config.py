@@ -27,6 +27,8 @@ class Settings(BaseSettings):
     redis_host: str = "127.0.0.1"
     redis_port: int = Field(default=6379, ge=1, le=65535)
     redis_db: int = Field(default=0, ge=0)
+    redis_jobs_stream: str = "forgequeue:jobs"
+    redis_worker_group: str = "forgequeue-workers"
 
     database_pool_size: int = Field(default=5, ge=1)
     database_max_overflow: int = Field(default=10, ge=0)

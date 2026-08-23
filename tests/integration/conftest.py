@@ -3,9 +3,11 @@ from collections.abc import AsyncIterator, Iterator
 import pytest
 import pytest_asyncio
 from fastapi.testclient import TestClient
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from forgequeue.api.app import create_app
+from forgequeue.broker.redis import create_redis_client
 from forgequeue.core.config import get_settings
 from forgequeue.db.session import create_database_engine
 
@@ -64,3 +66,13 @@ async def database_session() -> AsyncIterator[AsyncSession]:
     finally:
         await engine.dispose()
         get_settings.cache_clear()
+
+
+@pytest_asyncio.fixture
+async def redis_client() -> AsyncIterator[Redis]:
+    client = create_redis_client(get_settings())
+
+    try:
+        yield client
+    finally:
+        await client.aclose()
