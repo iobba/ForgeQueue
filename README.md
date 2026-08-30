@@ -35,16 +35,6 @@ FastAPI --------> PostgreSQL
 Redis Streams --> Workers --> PostgreSQL
 ```
 
-## Roadmap
-
-| Version | Focus | Status |
-|---|---|---|
-| V0 | Runtime, infrastructure, configuration, migrations, health checks, and quality tooling | Complete |
-| V1 | Submission/query API, Redis Streams delivery, workers, and an end-to-end job flow | In progress |
-| V2 | Retries, timeouts, dead-letter handling, heartbeats, and idempotency | Planned |
-| V3 | Transactional outbox, scheduling, priorities, cancellation, and rate limiting | Planned |
-| V4 | CI/CD, metrics, dashboards, tracing, load testing, and production hardening | Planned |
-
 
 ## Technology stack
 

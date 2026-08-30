@@ -27,6 +27,7 @@ def create_redis_client(settings: Settings) -> Redis:
         host=settings.redis_host,
         port=settings.redis_port,
         db=settings.redis_db,
+        socket_timeout=settings.redis_socket_timeout_seconds,
         decode_responses=True,
     )
 
@@ -77,7 +78,7 @@ class RedisJobBroker:
         *,
         consumer_name: str,
         count: int = 1,
-        block_ms: int | None = 5_000,
+        block_ms: int | None = 1_000,
     ) -> list[ReceivedJobMessage]:
         if not consumer_name.strip():
             raise ValueError("consumer_name must not be blank")

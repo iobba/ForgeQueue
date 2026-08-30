@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator
 from typing import cast
 from uuid import uuid7
@@ -214,6 +215,18 @@ async def test_read_returns_empty_list_when_no_new_messages_exist(
         consumer_name="worker-one",
         block_ms=None,
     )
+
+    assert received_messages == []
+
+
+async def test_blocking_read_returns_before_the_socket_timeout(
+    redis_broker: RedisBrokerFixture,
+) -> None:
+    _, broker, _, _ = redis_broker
+    await broker.ensure_consumer_group()
+
+    async with asyncio.timeout(2):
+        received_messages = await broker.read(consumer_name="worker-one")
 
     assert received_messages == []
 

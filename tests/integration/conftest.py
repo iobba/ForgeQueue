@@ -4,12 +4,15 @@ import pytest
 import pytest_asyncio
 from fastapi.testclient import TestClient
 from redis.asyncio import Redis
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from forgequeue.api.app import create_app
 from forgequeue.broker.redis import create_redis_client
 from forgequeue.core.config import get_settings
-from forgequeue.db.session import create_database_engine
+from forgequeue.db.session import (
+    create_database_engine,
+    create_session_factory,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -63,6 +66,24 @@ async def database_session() -> AsyncIterator[AsyncSession]:
 
                 if transaction.is_active:
                     await transaction.rollback()
+    finally:
+        await engine.dispose()
+        get_settings.cache_clear()
+
+
+@pytest_asyncio.fixture
+async def database_session_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    get_settings.cache_clear()
+    settings = get_settings()
+
+    if settings.postgres_db != "forgequeue_test":
+        raise RuntimeError("Integration tests must use forgequeue_test")
+
+    engine = create_database_engine(settings)
+    session_factory = create_session_factory(engine)
+
+    try:
+        yield session_factory
     finally:
         await engine.dispose()
         get_settings.cache_clear()

@@ -28,7 +28,8 @@ TEST_DATABASE := forgequeue_test
 	test \
 	check \
 	check-all \
-	api-dev
+	api-dev \
+	worker
 
 help:
 	@echo "ForgeQueue development commands:"
@@ -56,6 +57,7 @@ help:
 	@echo "  make check                    Run quality checks and unit tests"
 	@echo "  make check-all                Run all quality checks and tests"
 	@echo "  make api-dev                  Start the FastAPI development server"
+	@echo "  make worker                   Start one ForgeQueue worker"
 
 compose-config:
 	$(COMPOSE) config
@@ -145,3 +147,6 @@ api-dev:
 		--reload \
 		--host 127.0.0.1 \
 		--port 8000
+
+worker:
+	$(UV) run forgequeue-worker
