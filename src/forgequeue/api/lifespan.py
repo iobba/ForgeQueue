@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 import structlog
 from fastapi import FastAPI
 
-from forgequeue.broker.redis import create_redis_client
+from forgequeue.broker.redis import RedisJobBroker, create_redis_client
 from forgequeue.core.config import get_settings
 from forgequeue.db.session import (
     create_database_engine,
@@ -25,8 +25,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     engine = create_database_engine(settings)
     session_factory = create_session_factory(engine)
     redis_client = create_redis_client(settings)
+    job_broker = RedisJobBroker(
+        redis_client,
+        stream_name=settings.redis_jobs_stream,
+        group_name=settings.redis_worker_group,
+    )
 
     app.state.redis_client = redis_client
+    app.state.job_broker = job_broker
     app.state.db_engine = engine
     app.state.db_session_factory = session_factory
     logger.info("application_started")

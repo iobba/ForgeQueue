@@ -20,9 +20,13 @@ frameworks solve, including:
 
 ## Architecture
 
-PostgreSQL is the authoritative store for job state. Redis Streams will provide
-the initial delivery mechanism; workers and broker delivery are planned for the
-remaining V1 milestones.
+PostgreSQL is the authoritative store for job state. Redis Streams provides the
+delivery mechanism, while independent workers consume queued messages, execute
+the registered handler, and persist the resulting state back to PostgreSQL.
+
+Submitting a job returns immediately with its ID. A worker can then process the
+job asynchronously, and clients can retrieve its current status and result
+through the API.
 
 ```text
 Client
@@ -30,7 +34,6 @@ Client
   v
 FastAPI --------> PostgreSQL
   |
-  | planned
   v
 Redis Streams --> Workers --> PostgreSQL
 ```
@@ -74,6 +77,8 @@ make help              # list all commands
 make infra-up          # start PostgreSQL and Redis
 make infra-check       # verify dependency readiness
 make test-db-setup     # create and migrate the isolated test database
+make api-dev           # start the development API server
+make worker            # start one ForgeQueue worker
 make check             # static checks and unit tests
 make check-all         # static checks and the complete test suite
 make infra-down        # stop containers while preserving data

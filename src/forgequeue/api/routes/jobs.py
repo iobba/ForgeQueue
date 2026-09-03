@@ -3,7 +3,10 @@ from uuid import UUID
 
 from fastapi import APIRouter, Query, Response, status
 
-from forgequeue.api.dependencies import JobServiceDependency
+from forgequeue.api.dependencies import (
+    JobServiceDependency,
+    JobSubmissionServiceDependency,
+)
 from forgequeue.jobs.schemas import (
     ErrorResponse,
     JobCreateRequest,
@@ -22,10 +25,10 @@ router = APIRouter(prefix="/jobs", tags=["jobs"])
 )
 async def submit_job(
     request: JobCreateRequest,
-    service: JobServiceDependency,
+    submission_service: JobSubmissionServiceDependency,
     response: Response,
 ) -> JobResponse:
-    job = await service.create_job(
+    job = await submission_service.submit(
         job_type=request.type,
         payload=request.payload.model_dump(),
         max_attempts=request.max_attempts,
