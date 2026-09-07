@@ -12,6 +12,13 @@ class JobNotFoundError(LookupError):
         super().__init__(f"Job {job_id} was not found")
 
 
+class JobAttemptsExhaustedError(RuntimeError):
+    def __init__(self, job_id: UUID, max_attempts: int) -> None:
+        self.job_id = job_id
+        self.max_attempts = max_attempts
+        super().__init__(f"Job {job_id} has exhausted its {max_attempts} attempts")
+
+
 class JobService:
     def __init__(self, repository: JobRepository) -> None:
         self._repository = repository
@@ -58,8 +65,11 @@ class JobService:
             raise JobNotFoundError(job_id=job_id)
 
         validate_transition(job.status, JobStatus.RUNNING)
+        if job.attempts >= job.max_attempts:
+            raise JobAttemptsExhaustedError(job.id, job.max_attempts)
 
         job.status = JobStatus.RUNNING
+        job.attempts += 1
         job.started_at = datetime.now(UTC)
 
         return job

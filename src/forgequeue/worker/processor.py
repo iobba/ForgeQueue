@@ -6,6 +6,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from forgequeue.broker.messages import ReceivedJobMessage
 from forgequeue.broker.redis import RedisJobBroker
+from forgequeue.jobs.attempt_repository import JobAttemptRepository
+from forgequeue.jobs.attempt_service import JobAttemptService
+from forgequeue.jobs.execution_errors import JobExecutionError, PermanentJobError
 from forgequeue.jobs.repository import JobRepository
 from forgequeue.jobs.service import JobService
 from forgequeue.worker.handlers import UnsupportedJobTypeError, get_handler
@@ -42,7 +45,12 @@ class JobProcessor:
         self._broker = broker
         self._session_factory = session_factory
 
-    async def process(self, delivery: ReceivedJobMessage) -> None:
+    async def process(
+        self,
+        delivery: ReceivedJobMessage,
+        *,
+        worker_id: str,
+    ) -> None:
         job_id = delivery.message.job_id
 
         async with self._session_factory.begin() as session:
@@ -56,6 +64,13 @@ class JobProcessor:
                     database_job_type=job.job_type,
                 )
 
+            attempt_service = JobAttemptService(JobAttemptRepository(session))
+            attempt = await attempt_service.start_attempt(
+                job_id=job.id,
+                attempt_number=job.attempts,
+                worker_id=worker_id,
+            )
+            attempt_id = attempt.id
             job_type = job.job_type
             payload = dict(job.payload)
 
@@ -65,29 +80,41 @@ class JobProcessor:
             handler = get_handler(job_type)
             result = handler(payload)
         except UnsupportedJobTypeError as exc:
+            error = PermanentJobError(
+                error_code=UNSUPPORTED_JOB_TYPE_ERROR_CODE,
+                safe_message=(
+                    f"No handler is registered for job type {exc.job_type!r}"
+                ),
+            )
             await self._persist_failure(
                 job_id,
-                error_code=UNSUPPORTED_JOB_TYPE_ERROR_CODE,
-                error_message=f"No handler is registered for job type {exc.job_type!r}",
+                attempt_id=attempt_id,
+                error=error,
             )
             logger.warning(
                 "job_failed",
-                error_code=UNSUPPORTED_JOB_TYPE_ERROR_CODE,
+                error_code=error.error_code,
             )
         except ValidationError:
+            error = PermanentJobError(
+                error_code=INVALID_JOB_PAYLOAD_ERROR_CODE,
+                safe_message="Stored job payload failed validation",
+            )
             await self._persist_failure(
                 job_id,
-                error_code=INVALID_JOB_PAYLOAD_ERROR_CODE,
-                error_message="Stored job payload failed validation",
+                attempt_id=attempt_id,
+                error=error,
             )
             logger.warning(
                 "job_failed",
-                error_code=INVALID_JOB_PAYLOAD_ERROR_CODE,
+                error_code=error.error_code,
             )
         else:
             async with self._session_factory.begin() as session:
                 service = JobService(JobRepository(session))
                 await service.complete_job(job_id, result)
+                attempt_service = JobAttemptService(JobAttemptRepository(session))
+                await attempt_service.succeed_attempt(attempt_id)
             logger.info("job_completed")
 
         acknowledged_count = await self._broker.acknowledge(delivery.entry_id)
@@ -100,13 +127,15 @@ class JobProcessor:
         self,
         job_id: UUID,
         *,
-        error_code: str,
-        error_message: str,
+        attempt_id: UUID,
+        error: JobExecutionError,
     ) -> None:
         async with self._session_factory.begin() as session:
             service = JobService(JobRepository(session))
             await service.fail_job(
                 job_id,
-                error_code=error_code,
-                error_message=error_message,
+                error_code=error.error_code,
+                error_message=error.safe_message,
             )
+            attempt_service = JobAttemptService(JobAttemptRepository(session))
+            await attempt_service.fail_attempt(attempt_id, error)

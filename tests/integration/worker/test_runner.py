@@ -10,6 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from forgequeue.broker.messages import JobMessage
 from forgequeue.broker.redis import RedisJobBroker
 from forgequeue.db.models import Job
+from forgequeue.jobs.attempt_repository import JobAttemptRepository
+from forgequeue.jobs.attempts import JobAttemptStatus
 from forgequeue.jobs.repository import JobRepository
 from forgequeue.jobs.service import JobService
 from forgequeue.jobs.status import JobStatus
@@ -74,6 +76,10 @@ async def test_two_workers_share_deliveries_from_one_consumer_group(
 
         async with database_session_factory() as session:
             jobs = [await JobRepository(session).get(job_id) for job_id in job_ids]
+            attempts = [
+                await JobAttemptRepository(session).list_for_job(job_id)
+                for job_id in job_ids
+            ]
 
         consumers = cast(
             list[dict[str, object]],
@@ -90,6 +96,15 @@ async def test_two_workers_share_deliveries_from_one_consumer_group(
             {"sum": 3},
             {"sum": 30},
         ]
+        assert all(len(job_attempts) == 1 for job_attempts in attempts)
+        assert {
+            job_attempts[0].worker_id for job_attempts in attempts if job_attempts
+        } == {"worker-one", "worker-two"}
+        assert all(
+            job_attempts[0].status is JobAttemptStatus.SUCCEEDED
+            for job_attempts in attempts
+            if job_attempts
+        )
         assert {consumer["name"] for consumer in consumers} == {
             "worker-one",
             "worker-two",

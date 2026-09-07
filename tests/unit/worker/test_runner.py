@@ -68,9 +68,16 @@ class FakeProcessor:
     def __init__(self, error: Exception | None = None) -> None:
         self.error = error
         self.processed_deliveries: list[ReceivedJobMessage] = []
+        self.worker_ids: list[str] = []
 
-    async def process(self, delivery: ReceivedJobMessage) -> None:
+    async def process(
+        self,
+        delivery: ReceivedJobMessage,
+        *,
+        worker_id: str,
+    ) -> None:
         self.processed_deliveries.append(delivery)
+        self.worker_ids.append(worker_id)
         if self.error is not None:
             raise self.error
 
@@ -147,6 +154,7 @@ async def test_run_once_returns_false_without_processing_when_queue_is_empty() -
         )
     ]
     assert processor.processed_deliveries == []
+    assert processor.worker_ids == []
 
 
 @pytest.mark.asyncio
@@ -165,6 +173,7 @@ async def test_run_once_delegates_one_delivery_and_returns_true() -> None:
         )
     ]
     assert processor.processed_deliveries == [delivery]
+    assert processor.worker_ids == ["worker-test"]
 
 
 @pytest.mark.asyncio
@@ -179,6 +188,7 @@ async def test_run_once_propagates_processor_exception() -> None:
         await worker.run_once(block_ms=None)
 
     assert processor.processed_deliveries == [delivery]
+    assert processor.worker_ids == ["worker-test"]
 
 
 @pytest.mark.asyncio
@@ -194,6 +204,7 @@ async def test_run_forever_initializes_group_once_and_skips_reads_when_stopped()
     assert broker.ensure_consumer_group_calls == 1
     assert broker.read_calls == []
     assert processor.processed_deliveries == []
+    assert processor.worker_ids == []
 
 
 @pytest.mark.asyncio
@@ -228,6 +239,7 @@ async def test_run_forever_propagates_processor_exception() -> None:
 
     assert broker.ensure_consumer_group_calls == 1
     assert processor.processed_deliveries == [delivery]
+    assert processor.worker_ids == ["worker-test"]
 
 
 @pytest.mark.asyncio
@@ -241,3 +253,4 @@ async def test_run_forever_propagates_broker_exception() -> None:
 
     assert broker.ensure_consumer_group_calls == 1
     assert processor.processed_deliveries == []
+    assert processor.worker_ids == []

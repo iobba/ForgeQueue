@@ -55,7 +55,10 @@ class Worker:
         ):
             logger.info("job_delivery_received")
             try:
-                await self._processor.process(delivery)
+                await self._processor.process(
+                    delivery,
+                    worker_id=self.worker_id,
+                )
             except Exception as exc:
                 logger.error(
                     "job_delivery_interrupted",

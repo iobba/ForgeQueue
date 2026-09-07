@@ -30,6 +30,7 @@ async def test_start_job_persists_running_state(
 
     assert persisted_job is not None
     assert persisted_job.status is JobStatus.RUNNING
+    assert persisted_job.attempts == 1
     assert persisted_job.started_at is not None
     assert persisted_job.completed_at is None
 
@@ -57,6 +58,7 @@ async def test_complete_job_persists_result(
 
     assert persisted_job is not None
     assert persisted_job.status is JobStatus.COMPLETED
+    assert persisted_job.attempts == 1
     assert persisted_job.result == result
     assert persisted_job.error_code is None
     assert persisted_job.error_message is None
@@ -90,6 +92,7 @@ async def test_fail_job_persists_error_details(
 
     assert persisted_job is not None
     assert persisted_job.status is JobStatus.FAILED
+    assert persisted_job.attempts == 1
     assert persisted_job.result is None
     assert persisted_job.error_code == "REPORT_GENERATION_FAILED"
     assert persisted_job.error_message == "PDF rendering failed"

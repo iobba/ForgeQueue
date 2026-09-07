@@ -5,7 +5,11 @@ import pytest
 
 from forgequeue.db.models import Job
 from forgequeue.jobs.repository import JobRepository
-from forgequeue.jobs.service import JobNotFoundError, JobService
+from forgequeue.jobs.service import (
+    JobAttemptsExhaustedError,
+    JobNotFoundError,
+    JobService,
+)
 from forgequeue.jobs.status import InvalidJobStatusTransition, JobStatus
 
 pytestmark = [
@@ -143,6 +147,7 @@ async def test_start_job_moves_queued_job_to_running() -> None:
     assert started_job is job
     assert repository.requested_job_id == job.id
     assert job.status is JobStatus.RUNNING
+    assert job.attempts == 1
     assert job.started_at is not None
     assert before <= job.started_at <= after
 
@@ -170,6 +175,23 @@ async def test_start_job_rejects_invalid_transition() -> None:
     assert exc_info.value.current is JobStatus.COMPLETED
     assert exc_info.value.target is JobStatus.RUNNING
     assert job.status is JobStatus.COMPLETED
+    assert job.attempts == 0
+    assert job.started_at is None
+
+
+async def test_start_job_rejects_exhausted_attempt_limit() -> None:
+    job = make_job(JobStatus.QUEUED)
+    job.attempts = job.max_attempts
+    repository = FakeJobRepository(job)
+    service = JobService(repository)
+
+    with pytest.raises(JobAttemptsExhaustedError) as exc_info:
+        await service.start_job(job.id)
+
+    assert exc_info.value.job_id == job.id
+    assert exc_info.value.max_attempts == job.max_attempts
+    assert job.status is JobStatus.QUEUED
+    assert job.attempts == job.max_attempts
     assert job.started_at is None
 
 

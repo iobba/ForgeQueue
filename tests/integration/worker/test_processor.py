@@ -12,6 +12,8 @@ import forgequeue.worker.processor as processor_module
 from forgequeue.broker.messages import JobMessage
 from forgequeue.broker.redis import RedisJobBroker
 from forgequeue.db.models import Job
+from forgequeue.jobs.attempt_repository import JobAttemptRepository
+from forgequeue.jobs.attempts import JobAttemptStatus, JobFailureKind
 from forgequeue.jobs.repository import JobRepository
 from forgequeue.jobs.service import JobService
 from forgequeue.jobs.status import JobStatus
@@ -99,15 +101,25 @@ async def test_process_completes_job_and_acknowledges_delivery(
         block_ms=None,
     )
 
-    await processor_environment.processor.process(deliveries[0])
+    await processor_environment.processor.process(
+        deliveries[0],
+        worker_id="worker-one",
+    )
 
     async with processor_environment.session_factory() as session:
         persisted_job = await JobRepository(session).get(job_id)
         assert persisted_job is not None
         assert persisted_job.status is JobStatus.COMPLETED
+        assert persisted_job.attempts == 1
         assert persisted_job.result == {"sum": 60}
         assert persisted_job.started_at is not None
         assert persisted_job.completed_at is not None
+        attempts = await JobAttemptRepository(session).list_for_job(job_id)
+        assert len(attempts) == 1
+        assert attempts[0].attempt_number == 1
+        assert attempts[0].worker_id == "worker-one"
+        assert attempts[0].status is JobAttemptStatus.SUCCEEDED
+        assert attempts[0].completed_at is not None
 
     assert deliveries[0].entry_id == entry_id
     assert await processor_environment.broker.list_pending() == []
@@ -127,14 +139,19 @@ async def test_process_rolls_back_mismatch_and_leaves_delivery_pending(
     )
 
     with pytest.raises(JobMessageMismatchError) as exc_info:
-        await processor_environment.processor.process(deliveries[0])
+        await processor_environment.processor.process(
+            deliveries[0],
+            worker_id="worker-one",
+        )
 
     async with processor_environment.session_factory() as session:
         persisted_job = await JobRepository(session).get(job_id)
         assert persisted_job is not None
         assert persisted_job.status is JobStatus.QUEUED
+        assert persisted_job.attempts == 0
         assert persisted_job.started_at is None
         assert persisted_job.completed_at is None
+        assert await JobAttemptRepository(session).list_for_job(job_id) == []
 
     pending_deliveries = await processor_environment.broker.list_pending()
     assert [delivery.entry_id for delivery in pending_deliveries] == [
@@ -162,12 +179,16 @@ async def test_process_persists_unsupported_job_type_and_acknowledges(
         block_ms=None,
     )
 
-    await processor_environment.processor.process(deliveries[0])
+    await processor_environment.processor.process(
+        deliveries[0],
+        worker_id="worker-one",
+    )
 
     async with processor_environment.session_factory() as session:
         persisted_job = await JobRepository(session).get(job_id)
         assert persisted_job is not None
         assert persisted_job.status is JobStatus.FAILED
+        assert persisted_job.attempts == 1
         assert persisted_job.result is None
         assert persisted_job.error_code == UNSUPPORTED_JOB_TYPE_ERROR_CODE
         assert persisted_job.error_message == (
@@ -175,6 +196,13 @@ async def test_process_persists_unsupported_job_type_and_acknowledges(
         )
         assert persisted_job.started_at is not None
         assert persisted_job.completed_at is not None
+        attempts = await JobAttemptRepository(session).list_for_job(job_id)
+        assert len(attempts) == 1
+        assert attempts[0].status is JobAttemptStatus.FAILED
+        assert attempts[0].failure_kind is JobFailureKind.PERMANENT
+        assert attempts[0].error_code == UNSUPPORTED_JOB_TYPE_ERROR_CODE
+        assert attempts[0].error_message == persisted_job.error_message
+        assert attempts[0].completed_at is not None
 
     assert await processor_environment.broker.list_pending() == []
 
@@ -195,16 +223,27 @@ async def test_process_persists_invalid_payload_without_exposing_it(
         block_ms=None,
     )
 
-    await processor_environment.processor.process(deliveries[0])
+    await processor_environment.processor.process(
+        deliveries[0],
+        worker_id="worker-one",
+    )
 
     async with processor_environment.session_factory() as session:
         persisted_job = await JobRepository(session).get(job_id)
         assert persisted_job is not None
         assert persisted_job.status is JobStatus.FAILED
+        assert persisted_job.attempts == 1
         assert persisted_job.result is None
         assert persisted_job.error_code == INVALID_JOB_PAYLOAD_ERROR_CODE
         assert persisted_job.error_message == "Stored job payload failed validation"
         assert "sensitive-invalid-value" not in persisted_job.error_message
+        attempts = await JobAttemptRepository(session).list_for_job(job_id)
+        assert len(attempts) == 1
+        assert attempts[0].status is JobAttemptStatus.FAILED
+        assert attempts[0].failure_kind is JobFailureKind.PERMANENT
+        assert attempts[0].error_code == INVALID_JOB_PAYLOAD_ERROR_CODE
+        assert attempts[0].error_message is not None
+        assert "sensitive-invalid-value" not in attempts[0].error_message
 
     assert await processor_environment.broker.list_pending() == []
 
@@ -234,14 +273,24 @@ async def test_process_leaves_unexpected_handler_failure_pending(
     monkeypatch.setattr(processor_module, "get_handler", get_failing_handler)
 
     with pytest.raises(RuntimeError, match="unexpected handler bug"):
-        await processor_environment.processor.process(deliveries[0])
+        await processor_environment.processor.process(
+            deliveries[0],
+            worker_id="worker-one",
+        )
 
     async with processor_environment.session_factory() as session:
         persisted_job = await JobRepository(session).get(job_id)
         assert persisted_job is not None
         assert persisted_job.status is JobStatus.RUNNING
+        assert persisted_job.attempts == 1
         assert persisted_job.completed_at is None
         assert persisted_job.error_code is None
+        attempts = await JobAttemptRepository(session).list_for_job(job_id)
+        assert len(attempts) == 1
+        assert attempts[0].status is JobAttemptStatus.RUNNING
+        assert attempts[0].worker_id == "worker-one"
+        assert attempts[0].completed_at is None
+        assert attempts[0].failure_kind is None
 
     pending_deliveries = await processor_environment.broker.list_pending()
     assert [delivery.entry_id for delivery in pending_deliveries] == [
