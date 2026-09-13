@@ -69,6 +69,7 @@ def test_submit_job_returns_accepted_job_and_persists_it(
     assert body["max_attempts"] == 1
     assert body["started_at"] is None
     assert body["completed_at"] is None
+    assert body["next_attempt_at"] is None
     assert datetime.fromisoformat(cast(str, body["created_at"])).tzinfo is not None
     assert datetime.fromisoformat(cast(str, body["updated_at"])).tzinfo is not None
 

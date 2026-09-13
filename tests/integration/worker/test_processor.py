@@ -1,5 +1,6 @@
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid7
 
 import pytest
@@ -14,7 +15,9 @@ from forgequeue.broker.redis import RedisJobBroker
 from forgequeue.db.models import Job
 from forgequeue.jobs.attempt_repository import JobAttemptRepository
 from forgequeue.jobs.attempts import JobAttemptStatus, JobFailureKind
+from forgequeue.jobs.execution_errors import RetryableJobError
 from forgequeue.jobs.repository import JobRepository
+from forgequeue.jobs.retry_policy import RetryPolicy
 from forgequeue.jobs.service import JobService
 from forgequeue.jobs.status import JobStatus
 from forgequeue.worker.handlers import JobHandler
@@ -75,12 +78,14 @@ async def create_persisted_job(
     *,
     job_type: str = "sum_numbers",
     payload: dict[str, object] | None = None,
+    max_attempts: int = 1,
 ) -> UUID:
     async with environment.session_factory.begin() as session:
         service = JobService(JobRepository(session))
         job = await service.create_job(
             job_type=job_type,
             payload=payload if payload is not None else {"numbers": [10, 20, 30]},
+            max_attempts=max_attempts,
         )
         job_id = job.id
 
@@ -296,3 +301,126 @@ async def test_process_leaves_unexpected_handler_failure_pending(
     assert [delivery.entry_id for delivery in pending_deliveries] == [
         deliveries[0].entry_id
     ]
+
+
+async def test_process_schedules_retryable_failure_with_backoff_and_acknowledges(
+    processor_environment: ProcessorTestEnvironment,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scheduled_at = datetime(2026, 9, 10, 12, 0, tzinfo=UTC)
+    job_id = await create_persisted_job(
+        processor_environment,
+        max_attempts=3,
+    )
+    await processor_environment.broker.ensure_consumer_group()
+    await processor_environment.broker.publish(
+        JobMessage(job_id=job_id, job_type="sum_numbers")
+    )
+    deliveries = await processor_environment.broker.read(
+        consumer_name="worker-one",
+        block_ms=None,
+    )
+
+    def raise_retryable_error(payload: dict[str, object]) -> dict[str, object]:
+        del payload
+        raise RetryableJobError(
+            error_code="dependency_unavailable",
+            safe_message="A dependency is temporarily unavailable",
+        )
+
+    def get_failing_handler(job_type: str) -> JobHandler:
+        del job_type
+        return raise_retryable_error
+
+    monkeypatch.setattr(processor_module, "get_handler", get_failing_handler)
+    processor = JobProcessor(
+        processor_environment.broker,
+        processor_environment.session_factory,
+        retry_policy=RetryPolicy(
+            base_delay_seconds=10,
+            max_delay_seconds=60,
+        ),
+        jitter_source=lambda: 0.5,
+        clock=lambda: scheduled_at,
+    )
+
+    await processor.process(deliveries[0], worker_id="worker-one")
+
+    async with processor_environment.session_factory() as session:
+        persisted_job = await JobRepository(session).get(job_id)
+        assert persisted_job is not None
+        assert persisted_job.status is JobStatus.RETRY_SCHEDULED
+        assert persisted_job.attempts == 1
+        assert persisted_job.result is None
+        assert persisted_job.error_code == "dependency_unavailable"
+        assert persisted_job.error_message == (
+            "A dependency is temporarily unavailable"
+        )
+        assert persisted_job.completed_at is None
+        assert persisted_job.next_attempt_at == scheduled_at + timedelta(seconds=7.5)
+        attempts = await JobAttemptRepository(session).list_for_job(job_id)
+        assert len(attempts) == 1
+        assert attempts[0].status is JobAttemptStatus.FAILED
+        assert attempts[0].failure_kind is JobFailureKind.RETRYABLE
+        assert attempts[0].error_code == "dependency_unavailable"
+        assert attempts[0].completed_at is not None
+
+    assert await processor_environment.broker.list_pending() == []
+
+
+async def test_process_makes_exhausted_retryable_failure_terminal(
+    processor_environment: ProcessorTestEnvironment,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_id = await create_persisted_job(
+        processor_environment,
+        max_attempts=1,
+    )
+    await processor_environment.broker.ensure_consumer_group()
+    await processor_environment.broker.publish(
+        JobMessage(job_id=job_id, job_type="sum_numbers")
+    )
+    deliveries = await processor_environment.broker.read(
+        consumer_name="worker-one",
+        block_ms=None,
+    )
+
+    def raise_retryable_error(payload: dict[str, object]) -> dict[str, object]:
+        del payload
+        raise RetryableJobError(
+            error_code="dependency_unavailable",
+            safe_message="A dependency is temporarily unavailable",
+        )
+
+    def get_failing_handler(job_type: str) -> JobHandler:
+        del job_type
+        return raise_retryable_error
+
+    def reject_jitter_call() -> float:
+        raise AssertionError(
+            "Jitter must not be generated after attempts are exhausted"
+        )
+
+    monkeypatch.setattr(processor_module, "get_handler", get_failing_handler)
+    processor = JobProcessor(
+        processor_environment.broker,
+        processor_environment.session_factory,
+        jitter_source=reject_jitter_call,
+    )
+
+    await processor.process(deliveries[0], worker_id="worker-one")
+
+    async with processor_environment.session_factory() as session:
+        persisted_job = await JobRepository(session).get(job_id)
+        assert persisted_job is not None
+        assert persisted_job.status is JobStatus.FAILED
+        assert persisted_job.attempts == 1
+        assert persisted_job.error_code == "dependency_unavailable"
+        assert persisted_job.completed_at is not None
+        assert persisted_job.next_attempt_at is None
+        attempts = await JobAttemptRepository(session).list_for_job(job_id)
+        assert len(attempts) == 1
+        assert attempts[0].status is JobAttemptStatus.FAILED
+        assert attempts[0].failure_kind is JobFailureKind.RETRYABLE
+
+    assert await processor_environment.broker.list_pending() == []

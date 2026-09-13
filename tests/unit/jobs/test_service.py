@@ -1,13 +1,15 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid7
 
 import pytest
 
 from forgequeue.db.models import Job
+from forgequeue.jobs.execution_errors import PermanentJobError, RetryableJobError
 from forgequeue.jobs.repository import JobRepository
 from forgequeue.jobs.service import (
     JobAttemptsExhaustedError,
     JobNotFoundError,
+    JobRetryNotReadyError,
     JobService,
 )
 from forgequeue.jobs.status import InvalidJobStatusTransition, JobStatus
@@ -73,6 +75,7 @@ def make_job(status: JobStatus) -> Job:
         payload={"customer_id": 42},
         attempts=0,
         max_attempts=3,
+        next_attempt_at=None,
     )
 
 
@@ -195,6 +198,48 @@ async def test_start_job_rejects_exhausted_attempt_limit() -> None:
     assert job.started_at is None
 
 
+async def test_start_job_rejects_retry_before_it_is_due() -> None:
+    due_at = datetime(2026, 9, 10, 12, 0, tzinfo=UTC)
+    job = make_job(JobStatus.RETRY_SCHEDULED)
+    job.attempts = 1
+    job.next_attempt_at = due_at
+    repository = FakeJobRepository(job)
+    service = JobService(repository)
+
+    with pytest.raises(JobRetryNotReadyError) as exc_info:
+        await service.start_job(
+            job.id,
+            started_at=due_at - timedelta(microseconds=1),
+        )
+
+    assert exc_info.value.job_id == job.id
+    assert exc_info.value.next_attempt_at == due_at
+    assert job.status is JobStatus.RETRY_SCHEDULED
+    assert job.attempts == 1
+    assert job.next_attempt_at == due_at
+
+
+async def test_start_job_starts_due_retry_and_clears_previous_error() -> None:
+    due_at = datetime(2026, 9, 10, 12, 0, tzinfo=UTC)
+    job = make_job(JobStatus.RETRY_SCHEDULED)
+    job.attempts = 1
+    job.error_code = "UPSTREAM_UNAVAILABLE"
+    job.error_message = "The upstream service is temporarily unavailable"
+    job.next_attempt_at = due_at
+    repository = FakeJobRepository(job)
+    service = JobService(repository)
+
+    started_job = await service.start_job(job.id, started_at=due_at)
+
+    assert started_job is job
+    assert job.status is JobStatus.RUNNING
+    assert job.attempts == 2
+    assert job.error_code is None
+    assert job.error_message is None
+    assert job.started_at == due_at
+    assert job.next_attempt_at is None
+
+
 async def test_complete_job_stores_result_and_completion_time() -> None:
     job = make_job(JobStatus.RUNNING)
     job.error_code = "old_error"
@@ -298,3 +343,210 @@ async def test_fail_job_rejects_invalid_transition() -> None:
     assert job.error_code is None
     assert job.error_message is None
     assert job.completed_at is None
+
+
+async def test_schedule_retry_stores_error_and_next_attempt_time() -> None:
+    scheduled_at = datetime(2026, 9, 10, 12, 0, tzinfo=UTC)
+    delay = timedelta(seconds=15)
+    job = make_job(JobStatus.RUNNING)
+    job.attempts = 1
+    job.result = {"partial": True}
+    job.completed_at = scheduled_at
+    repository = FakeJobRepository(job)
+    service = JobService(repository)
+
+    scheduled_job = await service.schedule_retry(
+        job.id,
+        error=RetryableJobError(
+            error_code="UPSTREAM_UNAVAILABLE",
+            safe_message="The upstream service is temporarily unavailable",
+        ),
+        delay=delay,
+        scheduled_at=scheduled_at,
+    )
+
+    assert scheduled_job is job
+    assert job.status is JobStatus.RETRY_SCHEDULED
+    assert job.attempts == 1
+    assert job.result is None
+    assert job.error_code == "UPSTREAM_UNAVAILABLE"
+    assert job.error_message == "The upstream service is temporarily unavailable"
+    assert job.completed_at is None
+    assert job.next_attempt_at == scheduled_at + delay
+
+
+async def test_schedule_retry_raises_when_job_is_missing() -> None:
+    repository = FakeJobRepository(None)
+    service = JobService(repository)
+    job_id = uuid7()
+
+    with pytest.raises(JobNotFoundError) as exc_info:
+        await service.schedule_retry(
+            job_id,
+            error=RetryableJobError(
+                error_code="UPSTREAM_UNAVAILABLE",
+                safe_message="The upstream service is temporarily unavailable",
+            ),
+            delay=timedelta(seconds=5),
+        )
+
+    assert exc_info.value.job_id == job_id
+
+
+async def test_schedule_retry_rejects_invalid_transition() -> None:
+    job = make_job(JobStatus.QUEUED)
+    repository = FakeJobRepository(job)
+    service = JobService(repository)
+
+    with pytest.raises(InvalidJobStatusTransition) as exc_info:
+        await service.schedule_retry(
+            job.id,
+            error=RetryableJobError(
+                error_code="UPSTREAM_UNAVAILABLE",
+                safe_message="The upstream service is temporarily unavailable",
+            ),
+            delay=timedelta(seconds=5),
+        )
+
+    assert exc_info.value.current is JobStatus.QUEUED
+    assert exc_info.value.target is JobStatus.RETRY_SCHEDULED
+    assert job.status is JobStatus.QUEUED
+
+
+async def test_schedule_retry_rejects_permanent_failure() -> None:
+    job = make_job(JobStatus.RUNNING)
+    job.attempts = 1
+    repository = FakeJobRepository(job)
+    service = JobService(repository)
+
+    with pytest.raises(ValueError, match="Only retryable failures"):
+        await service.schedule_retry(
+            job.id,
+            error=PermanentJobError(
+                error_code="INVALID_PAYLOAD",
+                safe_message="The job payload is invalid",
+            ),
+            delay=timedelta(seconds=5),
+        )
+
+    assert job.status is JobStatus.RUNNING
+    assert job.next_attempt_at is None
+
+
+@pytest.mark.parametrize("delay", [timedelta(0), timedelta(seconds=-1)])
+async def test_schedule_retry_rejects_non_positive_delay(
+    delay: timedelta,
+) -> None:
+    job = make_job(JobStatus.RUNNING)
+    job.attempts = 1
+    repository = FakeJobRepository(job)
+    service = JobService(repository)
+
+    with pytest.raises(ValueError, match="Retry delay must be positive"):
+        await service.schedule_retry(
+            job.id,
+            error=RetryableJobError(
+                error_code="UPSTREAM_UNAVAILABLE",
+                safe_message="The upstream service is temporarily unavailable",
+            ),
+            delay=delay,
+        )
+
+    assert job.status is JobStatus.RUNNING
+    assert job.next_attempt_at is None
+
+
+async def test_schedule_retry_rejects_exhausted_attempt_limit() -> None:
+    job = make_job(JobStatus.RUNNING)
+    job.attempts = job.max_attempts
+    repository = FakeJobRepository(job)
+    service = JobService(repository)
+
+    with pytest.raises(JobAttemptsExhaustedError) as exc_info:
+        await service.schedule_retry(
+            job.id,
+            error=RetryableJobError(
+                error_code="UPSTREAM_UNAVAILABLE",
+                safe_message="The upstream service is temporarily unavailable",
+            ),
+            delay=timedelta(seconds=5),
+        )
+
+    assert exc_info.value.job_id == job.id
+    assert exc_info.value.max_attempts == job.max_attempts
+    assert job.status is JobStatus.RUNNING
+    assert job.next_attempt_at is None
+
+
+async def test_queue_retry_moves_due_job_back_to_queued() -> None:
+    due_at = datetime(2026, 9, 10, 12, 0, tzinfo=UTC)
+    job = make_job(JobStatus.RETRY_SCHEDULED)
+    job.attempts = 1
+    job.error_code = "dependency_unavailable"
+    job.error_message = "A dependency is temporarily unavailable"
+    job.next_attempt_at = due_at
+    repository = FakeJobRepository(job)
+    service = JobService(repository)
+
+    queued_job = await service.queue_retry(job.id, queued_at=due_at)
+
+    assert queued_job is job
+    assert job.status is JobStatus.QUEUED
+    assert job.attempts == 1
+    assert job.error_code == "dependency_unavailable"
+    assert job.error_message == "A dependency is temporarily unavailable"
+    assert job.next_attempt_at is None
+
+
+async def test_queue_retry_raises_when_job_is_missing() -> None:
+    repository = FakeJobRepository(None)
+    service = JobService(repository)
+    job_id = uuid7()
+
+    with pytest.raises(JobNotFoundError) as exc_info:
+        await service.queue_retry(job_id)
+
+    assert exc_info.value.job_id == job_id
+
+
+async def test_queue_retry_rejects_invalid_transition() -> None:
+    job = make_job(JobStatus.RUNNING)
+    repository = FakeJobRepository(job)
+    service = JobService(repository)
+
+    with pytest.raises(InvalidJobStatusTransition) as exc_info:
+        await service.queue_retry(job.id)
+
+    assert exc_info.value.current is JobStatus.RUNNING
+    assert exc_info.value.target is JobStatus.QUEUED
+    assert job.status is JobStatus.RUNNING
+
+
+async def test_queue_retry_rejects_missing_next_attempt_time() -> None:
+    job = make_job(JobStatus.RETRY_SCHEDULED)
+    repository = FakeJobRepository(job)
+    service = JobService(repository)
+
+    with pytest.raises(ValueError, match="must have next_attempt_at"):
+        await service.queue_retry(job.id)
+
+    assert job.status is JobStatus.RETRY_SCHEDULED
+
+
+async def test_queue_retry_rejects_job_before_it_is_due() -> None:
+    due_at = datetime(2026, 9, 10, 12, 0, tzinfo=UTC)
+    job = make_job(JobStatus.RETRY_SCHEDULED)
+    job.next_attempt_at = due_at
+    repository = FakeJobRepository(job)
+    service = JobService(repository)
+
+    with pytest.raises(JobRetryNotReadyError) as exc_info:
+        await service.queue_retry(
+            job.id,
+            queued_at=due_at - timedelta(microseconds=1),
+        )
+
+    assert exc_info.value.job_id == job.id
+    assert exc_info.value.next_attempt_at == due_at
+    assert job.status is JobStatus.RETRY_SCHEDULED
+    assert job.next_attempt_at == due_at

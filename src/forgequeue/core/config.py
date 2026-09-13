@@ -32,6 +32,13 @@ class Settings(BaseSettings):
     redis_socket_timeout_seconds: float = Field(default=5.0, gt=0)
     redis_worker_block_ms: int = Field(default=1_000, ge=1)
 
+    retry_dispatcher_batch_size: int = Field(default=100, ge=1, le=1_000)
+    retry_dispatcher_poll_seconds: float = Field(
+        default=1.0,
+        gt=0,
+        allow_inf_nan=False,
+    )
+
     database_pool_size: int = Field(default=5, ge=1)
     database_max_overflow: int = Field(default=10, ge=0)
     database_pool_timeout: int = Field(default=30, ge=1)

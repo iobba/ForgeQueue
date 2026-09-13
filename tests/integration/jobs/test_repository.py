@@ -39,6 +39,7 @@ async def test_create_persists_job_with_defaults(
     assert job.error_message is None
     assert job.started_at is None
     assert job.completed_at is None
+    assert job.next_attempt_at is None
     assert job.created_at.tzinfo is not None
     assert job.updated_at.tzinfo is not None
 
@@ -171,3 +172,56 @@ async def test_count_jobs_counts_all_jobs_and_applies_status_filter(
     assert await repository.count_jobs() == initial_total + 2
     assert await repository.count_jobs(status=JobStatus.RUNNING) == initial_running + 1
     assert queued_job.status is JobStatus.QUEUED
+
+
+async def test_lock_due_retries_returns_oldest_due_jobs_with_limit(
+    database_session: AsyncSession,
+) -> None:
+    repository = JobRepository(database_session)
+    due_at = datetime(2026, 9, 10, 12, 0, tzinfo=UTC)
+    oldest_due = await repository.create(
+        job_type="oldest-due",
+        payload={},
+        max_attempts=3,
+    )
+    newest_due = await repository.create(
+        job_type="newest-due",
+        payload={},
+        max_attempts=3,
+    )
+    future = await repository.create(
+        job_type="future",
+        payload={},
+        max_attempts=3,
+    )
+    queued = await repository.create(job_type="queued", payload={})
+
+    for job, next_attempt_at in (
+        (oldest_due, due_at - timedelta(seconds=10)),
+        (newest_due, due_at),
+        (future, due_at + timedelta(seconds=1)),
+    ):
+        job.status = JobStatus.RETRY_SCHEDULED
+        job.attempts = 1
+        job.next_attempt_at = next_attempt_at
+    await database_session.flush()
+
+    jobs = await repository.lock_due_retries(due_at=due_at, limit=2)
+
+    assert [job.id for job in jobs] == [oldest_due.id, newest_due.id]
+    assert future.id not in {job.id for job in jobs}
+    assert queued.id not in {job.id for job in jobs}
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+async def test_lock_due_retries_rejects_non_positive_limit(
+    database_session: AsyncSession,
+    limit: int,
+) -> None:
+    repository = JobRepository(database_session)
+
+    with pytest.raises(ValueError, match="limit must be at least 1"):
+        await repository.lock_due_retries(
+            due_at=datetime.now(UTC),
+            limit=limit,
+        )

@@ -29,7 +29,8 @@ TEST_DATABASE := forgequeue_test
 	check \
 	check-all \
 	api-dev \
-	worker
+	worker \
+	retry-dispatcher
 
 help:
 	@echo "ForgeQueue development commands:"
@@ -58,6 +59,7 @@ help:
 	@echo "  make check-all                Run all quality checks and tests"
 	@echo "  make api-dev                  Start the FastAPI development server"
 	@echo "  make worker                   Start one ForgeQueue worker"
+	@echo "  make retry-dispatcher         Start the retry dispatcher"
 
 compose-config:
 	$(COMPOSE) config
@@ -150,3 +152,6 @@ api-dev:
 
 worker:
 	$(UV) run forgequeue-worker
+
+retry-dispatcher:
+	$(UV) run forgequeue-retry-dispatcher

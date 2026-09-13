@@ -1,3 +1,4 @@
+from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy import func, select
@@ -57,3 +58,25 @@ class JobRepository:
 
         count = await self._session.scalar(query)
         return count or 0
+
+    async def lock_due_retries(
+        self,
+        *,
+        due_at: datetime,
+        limit: int = 100,
+    ) -> list[Job]:
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+
+        query = (
+            select(Job)
+            .where(
+                Job.status == JobStatus.RETRY_SCHEDULED,
+                Job.next_attempt_at <= due_at,
+            )
+            .order_by(Job.next_attempt_at.asc(), Job.id.asc())
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        )
+        jobs = await self._session.scalars(query)
+        return list(jobs)

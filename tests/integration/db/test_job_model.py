@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from uuid import uuid7
 
 import pytest
@@ -6,6 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from forgequeue.db.models import Job
+from forgequeue.jobs.status import JobStatus
 
 pytestmark = [
     pytest.mark.integration,
@@ -101,3 +103,51 @@ async def test_database_rejects_invalid_status(
             statement,
             {"job_id": uuid7()},
         )
+
+
+async def test_rejects_retry_scheduled_without_next_attempt_time(
+    database_session: AsyncSession,
+) -> None:
+    job = Job(
+        job_type="generate_report",
+        status=JobStatus.RETRY_SCHEDULED,
+        payload={},
+    )
+    database_session.add(job)
+
+    with pytest.raises(IntegrityError):
+        await database_session.flush()
+
+
+async def test_rejects_next_attempt_time_for_non_scheduled_job(
+    database_session: AsyncSession,
+) -> None:
+    job = Job(
+        job_type="generate_report",
+        status=JobStatus.RUNNING,
+        payload={},
+        next_attempt_at=datetime(2026, 9, 10, 12, 0, tzinfo=UTC),
+    )
+    database_session.add(job)
+
+    with pytest.raises(IntegrityError):
+        await database_session.flush()
+
+
+async def test_accepts_retry_scheduled_with_next_attempt_time(
+    database_session: AsyncSession,
+) -> None:
+    next_attempt_at = datetime(2026, 9, 10, 12, 0, tzinfo=UTC)
+    job = Job(
+        job_type="generate_report",
+        status=JobStatus.RETRY_SCHEDULED,
+        payload={},
+        attempts=1,
+        max_attempts=3,
+        next_attempt_at=next_attempt_at,
+    )
+    database_session.add(job)
+
+    await database_session.flush()
+
+    assert job.next_attempt_at == next_attempt_at

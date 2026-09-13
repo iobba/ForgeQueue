@@ -149,6 +149,7 @@ def test_job_response_reads_attributes_from_job_model() -> None:
         created_at=now,
         started_at=now,
         completed_at=now,
+        next_attempt_at=None,
         updated_at=now,
     )
 
@@ -164,6 +165,7 @@ def test_job_response_reads_attributes_from_job_model() -> None:
     assert response.created_at == now
     assert response.started_at == now
     assert response.completed_at == now
+    assert response.next_attempt_at is None
     assert response.updated_at == now
 
 
@@ -183,6 +185,7 @@ def test_job_response_serializes_public_field_names_and_values() -> None:
             "created_at": now,
             "started_at": None,
             "completed_at": None,
+            "next_attempt_at": None,
             "updated_at": now,
         }
     )
@@ -191,6 +194,7 @@ def test_job_response_serializes_public_field_names_and_values() -> None:
 
     assert serialized["type"] == "sum_numbers"
     assert serialized["status"] == "queued"
+    assert serialized["next_attempt_at"] is None
     assert "job_type" not in serialized
 
 

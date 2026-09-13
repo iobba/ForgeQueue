@@ -7,6 +7,7 @@ from typing import Final
 class JobStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"
+    RETRY_SCHEDULED = "retry_scheduled"
     COMPLETED = "completed"
     FAILED = "failed"
 
@@ -14,7 +15,19 @@ class JobStatus(StrEnum):
 ALLOWED_TRANSITIONS: Final[Mapping[JobStatus, frozenset[JobStatus]]] = MappingProxyType(
     {
         JobStatus.QUEUED: frozenset({JobStatus.RUNNING}),
-        JobStatus.RUNNING: frozenset({JobStatus.COMPLETED, JobStatus.FAILED}),
+        JobStatus.RUNNING: frozenset(
+            {
+                JobStatus.RETRY_SCHEDULED,
+                JobStatus.COMPLETED,
+                JobStatus.FAILED,
+            }
+        ),
+        JobStatus.RETRY_SCHEDULED: frozenset(
+            {
+                JobStatus.QUEUED,
+                JobStatus.RUNNING,
+            }
+        ),
         JobStatus.COMPLETED: frozenset(),
         JobStatus.FAILED: frozenset(),
     }

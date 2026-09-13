@@ -40,10 +40,16 @@ class Job(Base):
             name="ck_jobs_job_type_not_blank",
         ),
         CheckConstraint(
-            "status IN ('QUEUED', 'RUNNING', 'COMPLETED', 'FAILED')",
+            "status IN ('QUEUED', 'RUNNING', 'RETRY_SCHEDULED', 'COMPLETED', 'FAILED')",
             name="ck_jobs_status_valid",
         ),
+        CheckConstraint(
+            "(status = 'RETRY_SCHEDULED' AND next_attempt_at IS NOT NULL) OR "
+            "(status <> 'RETRY_SCHEDULED' AND next_attempt_at IS NULL)",
+            name="ck_jobs_next_attempt_matches_status",
+        ),
         Index("ix_jobs_status_created_at", "status", "created_at"),
+        Index("ix_jobs_status_next_attempt_at", "status", "next_attempt_at"),
     )
 
     id: Mapped[UUID] = mapped_column(
@@ -62,6 +68,7 @@ class Job(Base):
             native_enum=False,
             create_constraint=False,
             validate_strings=True,
+            length=15,
         ),
         default=JobStatus.QUEUED,
         server_default=JobStatus.QUEUED.name,
@@ -105,6 +112,10 @@ class Job(Base):
         nullable=True,
     )
     completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    next_attempt_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
     )

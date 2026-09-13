@@ -51,6 +51,7 @@ class JobResponse(BaseModel):
     created_at: datetime
     started_at: datetime | None
     completed_at: datetime | None
+    next_attempt_at: datetime | None
     updated_at: datetime
 
 

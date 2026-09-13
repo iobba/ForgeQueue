@@ -10,8 +10,11 @@ from forgequeue.jobs.status import (
 VALID_TRANSITIONS = frozenset(
     {
         (JobStatus.QUEUED, JobStatus.RUNNING),
+        (JobStatus.RUNNING, JobStatus.RETRY_SCHEDULED),
         (JobStatus.RUNNING, JobStatus.COMPLETED),
         (JobStatus.RUNNING, JobStatus.FAILED),
+        (JobStatus.RETRY_SCHEDULED, JobStatus.QUEUED),
+        (JobStatus.RETRY_SCHEDULED, JobStatus.RUNNING),
     }
 )
 
