@@ -6,7 +6,11 @@ from typing import Protocol
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from forgequeue.broker.redis import RedisJobBroker, create_redis_client
+from forgequeue.broker.redis import (
+    RedisDeadLetterBroker,
+    RedisJobBroker,
+    create_redis_client,
+)
 from forgequeue.core.config import Settings, get_settings
 from forgequeue.core.logging import configure_logging
 from forgequeue.db.session import (
@@ -46,7 +50,15 @@ def create_worker(
         stream_name=settings.redis_jobs_stream,
         group_name=settings.redis_worker_group,
     )
-    processor = JobProcessor(broker, session_factory)
+    dead_letter_broker = RedisDeadLetterBroker(
+        redis_client,
+        stream_name=settings.redis_dead_letter_stream,
+    )
+    processor = JobProcessor(
+        broker,
+        dead_letter_broker,
+        session_factory,
+    )
     return Worker(broker, processor)
 
 

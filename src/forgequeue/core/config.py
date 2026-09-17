@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     redis_port: int = Field(default=6379, ge=1, le=65535)
     redis_db: int = Field(default=0, ge=0)
     redis_jobs_stream: str = "forgequeue:jobs"
+    redis_dead_letter_stream: str = "forgequeue:dead"
     redis_worker_group: str = "forgequeue-workers"
     redis_socket_timeout_seconds: float = Field(default=5.0, gt=0)
     redis_worker_block_ms: int = Field(default=1_000, ge=1)

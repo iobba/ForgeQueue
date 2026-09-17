@@ -7,10 +7,16 @@ import structlog
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from forgequeue.broker.messages import ReceivedJobMessage
-from forgequeue.broker.redis import RedisJobBroker
+from forgequeue.broker.messages import (
+    DeadLetterMessage,
+    DeadLetterReason,
+    JobDelivery,
+    MalformedJobDelivery,
+)
+from forgequeue.broker.redis import RedisDeadLetterBroker, RedisJobBroker
 from forgequeue.jobs.attempt_repository import JobAttemptRepository
 from forgequeue.jobs.attempt_service import JobAttemptService
+from forgequeue.jobs.attempts import JobFailureKind
 from forgequeue.jobs.execution_errors import JobExecutionError, PermanentJobError
 from forgequeue.jobs.repository import JobRepository
 from forgequeue.jobs.retry_policy import RetryPolicy
@@ -48,6 +54,7 @@ class JobProcessor:
     def __init__(
         self,
         broker: RedisJobBroker,
+        dead_letter_broker: RedisDeadLetterBroker,
         session_factory: async_sessionmaker[AsyncSession],
         *,
         retry_policy: RetryPolicy | None = None,
@@ -55,6 +62,7 @@ class JobProcessor:
         clock: Callable[[], datetime] = utc_now,
     ) -> None:
         self._broker = broker
+        self._dead_letter_broker = dead_letter_broker
         self._session_factory = session_factory
         self._retry_policy = retry_policy or RetryPolicy()
         self._jitter_source = jitter_source
@@ -62,10 +70,14 @@ class JobProcessor:
 
     async def process(
         self,
-        delivery: ReceivedJobMessage,
+        delivery: JobDelivery,
         *,
         worker_id: str,
     ) -> None:
+        if isinstance(delivery, MalformedJobDelivery):
+            await self.quarantine_malformed(delivery)
+            return
+
         job_id = delivery.message.job_id
 
         async with self._session_factory.begin() as session:
@@ -125,6 +137,8 @@ class JobProcessor:
                 attempt_id=attempt_id,
                 attempt_number=attempt_number,
                 max_attempts=max_attempts,
+                job_type=job_type,
+                source_entry_id=delivery.entry_id,
                 error=error,
             )
             if next_attempt_at is None:
@@ -152,6 +166,8 @@ class JobProcessor:
         attempt_id: UUID,
         attempt_number: int,
         max_attempts: int,
+        job_type: str,
+        source_entry_id: str,
         error: JobExecutionError,
     ) -> datetime | None:
         should_retry = self._retry_policy.can_retry(
@@ -189,4 +205,38 @@ class JobProcessor:
             attempt_service = JobAttemptService(JobAttemptRepository(session))
             await attempt_service.fail_attempt(attempt_id, error)
 
+            if delay is None:
+                reason = (
+                    DeadLetterReason.PERMANENT_FAILURE
+                    if error.failure_kind is JobFailureKind.PERMANENT
+                    else DeadLetterReason.RETRIES_EXHAUSTED
+                )
+                await self._dead_letter_broker.publish(
+                    DeadLetterMessage(
+                        source_entry_id=source_entry_id,
+                        job_id=job_id,
+                        job_type=job_type,
+                        attempt_number=attempt_number,
+                        reason=reason,
+                        failure_kind=error.failure_kind.value,
+                        error_code=error.error_code,
+                    )
+                )
+
         return next_attempt_at
+
+    async def quarantine_malformed(self, delivery: MalformedJobDelivery) -> None:
+        dead_letter_entry_id = await self._dead_letter_broker.publish(
+            DeadLetterMessage(
+                source_entry_id=delivery.entry_id,
+                reason=DeadLetterReason.MALFORMED_MESSAGE,
+                error_code=delivery.error_code,
+            )
+        )
+        acknowledged_count = await self._broker.acknowledge(delivery.entry_id)
+        logger.warning(
+            "malformed_job_delivery_quarantined",
+            source_entry_id=delivery.entry_id,
+            dead_letter_entry_id=dead_letter_entry_id,
+            acknowledged_count=acknowledged_count,
+        )

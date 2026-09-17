@@ -6,7 +6,11 @@ import pytest
 from fastapi import status
 from fastapi.testclient import TestClient
 
-from forgequeue.broker.redis import RedisJobBroker, create_redis_client
+from forgequeue.broker.redis import (
+    RedisDeadLetterBroker,
+    RedisJobBroker,
+    create_redis_client,
+)
 from forgequeue.core.config import get_settings
 from forgequeue.db.models import Job
 from forgequeue.db.session import create_database_engine, create_session_factory
@@ -28,7 +32,14 @@ async def process_one_delivery() -> tuple[bool, int]:
     )
     worker = Worker(
         broker,
-        JobProcessor(broker, session_factory),
+        JobProcessor(
+            broker,
+            RedisDeadLetterBroker(
+                redis_client,
+                stream_name=settings.redis_dead_letter_stream,
+            ),
+            session_factory,
+        ),
         worker_id="worker-end-to-end",
     )
 

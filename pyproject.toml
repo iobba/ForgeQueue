@@ -21,6 +21,7 @@ dependencies = [
 [project.scripts]
 forgequeue-worker = "forgequeue.worker.main:main"
 forgequeue-retry-dispatcher = "forgequeue.scheduler.main:main"
+forgequeue-dead-letters = "forgequeue.dead_letters.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.3,<0.13.0"]

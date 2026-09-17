@@ -4,6 +4,7 @@ from uuid import uuid7
 import structlog
 from structlog.contextvars import bound_contextvars
 
+from forgequeue.broker.messages import MalformedJobDelivery
 from forgequeue.broker.redis import RedisJobBroker
 from forgequeue.worker.processor import JobProcessor
 
@@ -47,6 +48,15 @@ class Worker:
             return False
 
         delivery = deliveries[0]
+        if isinstance(delivery, MalformedJobDelivery):
+            with bound_contextvars(entry_id=delivery.entry_id):
+                logger.warning(
+                    "malformed_job_delivery_received",
+                    error_code=delivery.error_code,
+                )
+                await self._processor.quarantine_malformed(delivery)
+            return True
+
         with bound_contextvars(
             worker_id=self.worker_id,
             job_id=str(delivery.message.job_id),

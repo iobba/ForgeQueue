@@ -1,17 +1,19 @@
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import cast
 from uuid import UUID, uuid7
 
 import pytest
 import pytest_asyncio
 from redis.asyncio import Redis
+from redis.exceptions import ResponseError
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import forgequeue.worker.processor as processor_module
 from forgequeue.broker.messages import JobMessage
-from forgequeue.broker.redis import RedisJobBroker
+from forgequeue.broker.redis import RedisDeadLetterBroker, RedisJobBroker
 from forgequeue.db.models import Job
 from forgequeue.jobs.attempt_repository import JobAttemptRepository
 from forgequeue.jobs.attempts import JobAttemptStatus, JobFailureKind
@@ -38,8 +40,10 @@ pytestmark = [
 class ProcessorTestEnvironment:
     processor: JobProcessor
     broker: RedisJobBroker
+    redis_client: Redis
     session_factory: async_sessionmaker[AsyncSession]
     stream_name: str
+    dead_letter_stream_name: str
     created_job_ids: set[UUID]
 
 
@@ -49,23 +53,34 @@ async def processor_environment(
     database_session_factory: async_sessionmaker[AsyncSession],
 ) -> AsyncIterator[ProcessorTestEnvironment]:
     stream_name = f"forgequeue:test:processor:{uuid7()}"
+    dead_letter_stream_name = f"forgequeue:test:processor:dead:{uuid7()}"
     broker = RedisJobBroker(
         redis_client,
         stream_name=stream_name,
         group_name="forgequeue-test-workers",
     )
+    dead_letter_broker = RedisDeadLetterBroker(
+        redis_client,
+        stream_name=dead_letter_stream_name,
+    )
     environment = ProcessorTestEnvironment(
-        processor=JobProcessor(broker, database_session_factory),
+        processor=JobProcessor(
+            broker,
+            dead_letter_broker,
+            database_session_factory,
+        ),
         broker=broker,
+        redis_client=redis_client,
         session_factory=database_session_factory,
         stream_name=stream_name,
+        dead_letter_stream_name=dead_letter_stream_name,
         created_job_ids=set(),
     )
 
     try:
         yield environment
     finally:
-        await redis_client.delete(stream_name)
+        await redis_client.delete(stream_name, dead_letter_stream_name)
         if environment.created_job_ids:
             async with database_session_factory.begin() as session:
                 await session.execute(
@@ -91,6 +106,15 @@ async def create_persisted_job(
 
     environment.created_job_ids.add(job_id)
     return job_id
+
+
+async def read_dead_letter_entries(
+    environment: ProcessorTestEnvironment,
+) -> list[tuple[str, dict[str, str]]]:
+    return cast(
+        list[tuple[str, dict[str, str]]],
+        await environment.redis_client.xrange(environment.dead_letter_stream_name),
+    )
 
 
 async def test_process_completes_job_and_acknowledges_delivery(
@@ -128,6 +152,7 @@ async def test_process_completes_job_and_acknowledges_delivery(
 
     assert deliveries[0].entry_id == entry_id
     assert await processor_environment.broker.list_pending() == []
+    assert await read_dead_letter_entries(processor_environment) == []
 
 
 async def test_process_rolls_back_mismatch_and_leaves_delivery_pending(
@@ -165,6 +190,7 @@ async def test_process_rolls_back_mismatch_and_leaves_delivery_pending(
     assert exc_info.value.job_id == job_id
     assert exc_info.value.message_job_type == "generate_report"
     assert exc_info.value.database_job_type == "sum_numbers"
+    assert await read_dead_letter_entries(processor_environment) == []
 
 
 async def test_process_persists_unsupported_job_type_and_acknowledges(
@@ -211,6 +237,19 @@ async def test_process_persists_unsupported_job_type_and_acknowledges(
 
     assert await processor_environment.broker.list_pending() == []
 
+    dead_letter_entries = await read_dead_letter_entries(processor_environment)
+    assert len(dead_letter_entries) == 1
+    assert dead_letter_entries[0][1] == {
+        "schema_version": "1",
+        "source_entry_id": deliveries[0].entry_id,
+        "job_id": str(job_id),
+        "job_type": "generate_report",
+        "attempt_number": "1",
+        "reason": "permanent_failure",
+        "failure_kind": "permanent",
+        "error_code": UNSUPPORTED_JOB_TYPE_ERROR_CODE,
+    }
+
 
 async def test_process_persists_invalid_payload_without_exposing_it(
     processor_environment: ProcessorTestEnvironment,
@@ -251,6 +290,56 @@ async def test_process_persists_invalid_payload_without_exposing_it(
         assert "sensitive-invalid-value" not in attempts[0].error_message
 
     assert await processor_environment.broker.list_pending() == []
+
+    dead_letter_entries = await read_dead_letter_entries(processor_environment)
+    assert len(dead_letter_entries) == 1
+    assert dead_letter_entries[0][1]["error_code"] == INVALID_JOB_PAYLOAD_ERROR_CODE
+    assert "sensitive-invalid-value" not in str(dead_letter_entries[0][1])
+
+
+async def test_process_rolls_back_terminal_failure_when_dead_letter_publish_fails(
+    processor_environment: ProcessorTestEnvironment,
+) -> None:
+    job_id = await create_persisted_job(
+        processor_environment,
+        job_type="generate_report",
+        payload={"customer_id": 42},
+    )
+    await processor_environment.broker.ensure_consumer_group()
+    await processor_environment.broker.publish(
+        JobMessage(job_id=job_id, job_type="generate_report")
+    )
+    deliveries = await processor_environment.broker.read(
+        consumer_name="worker-one",
+        block_ms=None,
+    )
+    await processor_environment.redis_client.set(
+        processor_environment.dead_letter_stream_name,
+        "not-a-stream",
+    )
+
+    with pytest.raises(ResponseError, match="WRONGTYPE"):
+        await processor_environment.processor.process(
+            deliveries[0],
+            worker_id="worker-one",
+        )
+
+    async with processor_environment.session_factory() as session:
+        persisted_job = await JobRepository(session).get(job_id)
+        assert persisted_job is not None
+        assert persisted_job.status is JobStatus.RUNNING
+        assert persisted_job.error_code is None
+        assert persisted_job.completed_at is None
+        attempts = await JobAttemptRepository(session).list_for_job(job_id)
+        assert len(attempts) == 1
+        assert attempts[0].status is JobAttemptStatus.RUNNING
+        assert attempts[0].failure_kind is None
+        assert attempts[0].error_code is None
+
+    pending_deliveries = await processor_environment.broker.list_pending()
+    assert [delivery.entry_id for delivery in pending_deliveries] == [
+        deliveries[0].entry_id
+    ]
 
 
 async def test_process_leaves_unexpected_handler_failure_pending(
@@ -335,6 +424,10 @@ async def test_process_schedules_retryable_failure_with_backoff_and_acknowledges
     monkeypatch.setattr(processor_module, "get_handler", get_failing_handler)
     processor = JobProcessor(
         processor_environment.broker,
+        RedisDeadLetterBroker(
+            processor_environment.redis_client,
+            stream_name=processor_environment.dead_letter_stream_name,
+        ),
         processor_environment.session_factory,
         retry_policy=RetryPolicy(
             base_delay_seconds=10,
@@ -366,6 +459,7 @@ async def test_process_schedules_retryable_failure_with_backoff_and_acknowledges
         assert attempts[0].completed_at is not None
 
     assert await processor_environment.broker.list_pending() == []
+    assert await read_dead_letter_entries(processor_environment) == []
 
 
 async def test_process_makes_exhausted_retryable_failure_terminal(
@@ -404,6 +498,10 @@ async def test_process_makes_exhausted_retryable_failure_terminal(
     monkeypatch.setattr(processor_module, "get_handler", get_failing_handler)
     processor = JobProcessor(
         processor_environment.broker,
+        RedisDeadLetterBroker(
+            processor_environment.redis_client,
+            stream_name=processor_environment.dead_letter_stream_name,
+        ),
         processor_environment.session_factory,
         jitter_source=reject_jitter_call,
     )
@@ -424,3 +522,16 @@ async def test_process_makes_exhausted_retryable_failure_terminal(
         assert attempts[0].failure_kind is JobFailureKind.RETRYABLE
 
     assert await processor_environment.broker.list_pending() == []
+
+    dead_letter_entries = await read_dead_letter_entries(processor_environment)
+    assert len(dead_letter_entries) == 1
+    assert dead_letter_entries[0][1] == {
+        "schema_version": "1",
+        "source_entry_id": deliveries[0].entry_id,
+        "job_id": str(job_id),
+        "job_type": "sum_numbers",
+        "attempt_number": "1",
+        "reason": "retries_exhausted",
+        "failure_kind": "retryable",
+        "error_code": "dependency_unavailable",
+    }

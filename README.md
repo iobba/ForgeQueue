@@ -40,6 +40,8 @@ Redis Streams <--- Retry dispatcher
   |
   v
 Workers --------> PostgreSQL
+  |
+  +-------------> Dead-letter stream
 ```
 
 ## Technology stack
@@ -83,9 +85,22 @@ make test-db-setup     # create and migrate the isolated test database
 make api-dev           # start the development API server
 make worker            # start one ForgeQueue worker
 make retry-dispatcher  # publish due retries back to Redis
+make dead-letters      # list recent terminal or malformed deliveries
 make check             # static checks and unit tests
 make check-all         # static checks and the complete test suite
 make infra-down        # stop containers while preserving data
 ```
 
 `make infra-reset CONFIRM=yes` deletes the local PostgreSQL and Redis volumes.
+
+## Dead-letter inspection
+
+Permanent failures, exhausted retries, and malformed broker entries are copied
+to a separate Redis Stream using a sanitized message contract. PostgreSQL keeps
+the authoritative job status; this stream is an operational inbox for failures
+that may require investigation.
+
+```bash
+make dead-letters LIMIT=20
+uv run forgequeue-dead-letters show 1730000000000-0
+```

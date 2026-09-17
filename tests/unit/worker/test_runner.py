@@ -5,7 +5,12 @@ from uuid import UUID, uuid7
 
 import pytest
 
-from forgequeue.broker.messages import JobMessage, ReceivedJobMessage
+from forgequeue.broker.messages import (
+    JobDelivery,
+    JobMessage,
+    MalformedJobDelivery,
+    ReceivedJobMessage,
+)
 from forgequeue.broker.redis import RedisJobBroker
 from forgequeue.worker.processor import JobProcessor
 from forgequeue.worker.runner import Worker, generate_worker_id
@@ -23,7 +28,7 @@ class ReadCall:
 class FakeBroker:
     def __init__(
         self,
-        deliveries: list[ReceivedJobMessage] | None = None,
+        deliveries: list[JobDelivery] | None = None,
         *,
         read_error: Exception | None = None,
         stop_event: asyncio.Event | None = None,
@@ -45,7 +50,7 @@ class FakeBroker:
         consumer_name: str,
         count: int,
         block_ms: int | None,
-    ) -> list[ReceivedJobMessage]:
+    ) -> list[JobDelivery]:
         self.read_calls.append(
             ReadCall(
                 consumer_name=consumer_name,
@@ -68,6 +73,7 @@ class FakeProcessor:
     def __init__(self, error: Exception | None = None) -> None:
         self.error = error
         self.processed_deliveries: list[ReceivedJobMessage] = []
+        self.quarantined_deliveries: list[MalformedJobDelivery] = []
         self.worker_ids: list[str] = []
 
     async def process(
@@ -81,10 +87,15 @@ class FakeProcessor:
         if self.error is not None:
             raise self.error
 
+    async def quarantine_malformed(self, delivery: MalformedJobDelivery) -> None:
+        self.quarantined_deliveries.append(delivery)
+        if self.error is not None:
+            raise self.error
+
 
 def build_worker(
     *,
-    deliveries: list[ReceivedJobMessage] | None = None,
+    deliveries: list[JobDelivery] | None = None,
     processor_error: Exception | None = None,
     read_error: Exception | None = None,
     stop_event: asyncio.Event | None = None,
@@ -174,6 +185,19 @@ async def test_run_once_delegates_one_delivery_and_returns_true() -> None:
     ]
     assert processor.processed_deliveries == [delivery]
     assert processor.worker_ids == ["worker-test"]
+
+
+@pytest.mark.asyncio
+async def test_run_once_quarantines_malformed_delivery_without_job_processing() -> None:
+    delivery = MalformedJobDelivery(entry_id="1730000000000-0")
+    worker, _, processor = build_worker(deliveries=[delivery])
+
+    processed = await worker.run_once(block_ms=None)
+
+    assert processed is True
+    assert processor.quarantined_deliveries == [delivery]
+    assert processor.processed_deliveries == []
+    assert processor.worker_ids == []
 
 
 @pytest.mark.asyncio

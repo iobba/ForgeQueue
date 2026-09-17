@@ -23,6 +23,7 @@ def test_accepts_redis_block_time_shorter_than_socket_timeout() -> None:
 
     assert settings.redis_worker_block_ms == 1_000
     assert settings.redis_socket_timeout_seconds == 5.0
+    assert settings.redis_dead_letter_stream == "forgequeue:dead"
     assert settings.retry_dispatcher_batch_size == 100
     assert settings.retry_dispatcher_poll_seconds == 1.0
 

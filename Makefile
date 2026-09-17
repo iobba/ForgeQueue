@@ -30,7 +30,8 @@ TEST_DATABASE := forgequeue_test
 	check-all \
 	api-dev \
 	worker \
-	retry-dispatcher
+	retry-dispatcher \
+	dead-letters
 
 help:
 	@echo "ForgeQueue development commands:"
@@ -60,6 +61,7 @@ help:
 	@echo "  make api-dev                  Start the FastAPI development server"
 	@echo "  make worker                   Start one ForgeQueue worker"
 	@echo "  make retry-dispatcher         Start the retry dispatcher"
+	@echo "  make dead-letters LIMIT=20    List recent dead-letter entries"
 
 compose-config:
 	$(COMPOSE) config
@@ -155,3 +157,6 @@ worker:
 
 retry-dispatcher:
 	$(UV) run forgequeue-retry-dispatcher
+
+dead-letters:
+	$(UV) run forgequeue-dead-letters list --limit $(or $(LIMIT),20)

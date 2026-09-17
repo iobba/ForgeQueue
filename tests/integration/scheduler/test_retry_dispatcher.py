@@ -7,7 +7,7 @@ from redis.asyncio import Redis
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from forgequeue.broker.messages import JobMessage
+from forgequeue.broker.messages import JobMessage, ReceivedJobMessage
 from forgequeue.broker.redis import RedisJobBroker
 from forgequeue.db.models import Job
 from forgequeue.jobs.repository import JobRepository
@@ -117,6 +117,7 @@ async def test_run_once_publishes_only_due_retries_and_marks_them_queued(
 
         assert dispatched_count == 1
         assert len(deliveries) == 1
+        assert isinstance(deliveries[0], ReceivedJobMessage)
         assert deliveries[0].message == JobMessage(
             job_id=due_job_id,
             job_type="sum_numbers",

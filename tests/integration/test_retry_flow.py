@@ -8,7 +8,7 @@ from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import forgequeue.worker.processor as processor_module
-from forgequeue.broker.redis import RedisJobBroker
+from forgequeue.broker.redis import RedisDeadLetterBroker, RedisJobBroker
 from forgequeue.db.models import Job
 from forgequeue.jobs.attempt_repository import JobAttemptRepository
 from forgequeue.jobs.attempts import JobAttemptStatus, JobFailureKind
@@ -34,6 +34,7 @@ async def test_retryable_job_is_dispatched_again_and_succeeds(
 ) -> None:
     scheduled_at = datetime(2026, 9, 10, 12, 0, tzinfo=UTC)
     stream_name = f"forgequeue:test:retry-flow:{uuid7()}"
+    dead_letter_stream_name = f"forgequeue:test:retry-flow:dead:{uuid7()}"
     broker = RedisJobBroker(
         redis_client,
         stream_name=stream_name,
@@ -41,6 +42,10 @@ async def test_retryable_job_is_dispatched_again_and_succeeds(
     )
     processor = JobProcessor(
         broker,
+        RedisDeadLetterBroker(
+            redis_client,
+            stream_name=dead_letter_stream_name,
+        ),
         database_session_factory,
         retry_policy=RetryPolicy(
             base_delay_seconds=5,
@@ -119,7 +124,7 @@ async def test_retryable_job_is_dispatched_again_and_succeeds(
         assert attempts[1].failure_kind is None
         assert await broker.list_pending() == []
     finally:
-        await redis_client.delete(stream_name)
+        await redis_client.delete(stream_name, dead_letter_stream_name)
         if job_id is not None:
             async with database_session_factory.begin() as session:
                 await session.execute(delete(Job).where(Job.id == job_id))

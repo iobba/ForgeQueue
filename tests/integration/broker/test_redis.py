@@ -5,13 +5,13 @@ from uuid import uuid7
 
 import pytest
 import pytest_asyncio
-from pydantic import ValidationError
 from redis.asyncio import Redis
 from redis.exceptions import ResponseError
 from redis.typing import EncodableT, FieldT
 
 from forgequeue.broker.messages import (
     JobMessage,
+    MalformedJobDelivery,
     PendingJobDelivery,
     ReceivedJobMessage,
 )
@@ -201,8 +201,18 @@ async def test_read_respects_count_and_leaves_newer_messages_available(
         block_ms=None,
     )
 
-    assert [received.message for received in first_batch] == messages[:2]
-    assert [received.message for received in second_batch] == messages[2:]
+    assert all(isinstance(received, ReceivedJobMessage) for received in first_batch)
+    assert all(isinstance(received, ReceivedJobMessage) for received in second_batch)
+    assert [
+        received.message
+        for received in first_batch
+        if isinstance(received, ReceivedJobMessage)
+    ] == messages[:2]
+    assert [
+        received.message
+        for received in second_batch
+        if isinstance(received, ReceivedJobMessage)
+    ] == messages[2:]
 
 
 async def test_read_returns_empty_list_when_no_new_messages_exist(
@@ -252,7 +262,7 @@ async def test_read_assigns_message_to_consumer_and_pending_list(
     assert consumers[0]["pending"] == 1
 
 
-async def test_read_rejects_invalid_stored_message(
+async def test_read_returns_sanitized_malformed_delivery_for_invalid_message(
     redis_broker: RedisBrokerFixture,
 ) -> None:
     redis_client, broker, stream_name, _ = redis_broker
@@ -264,11 +274,15 @@ async def test_read_rejects_invalid_stored_message(
     await redis_client.xadd(stream_name, invalid_fields)
     await broker.ensure_consumer_group()
 
-    with pytest.raises(ValidationError):
-        await broker.read(
-            consumer_name="worker-one",
-            block_ms=None,
-        )
+    deliveries = await broker.read(
+        consumer_name="worker-one",
+        block_ms=None,
+    )
+
+    assert len(deliveries) == 1
+    assert isinstance(deliveries[0], MalformedJobDelivery)
+    assert deliveries[0].error_code == "malformed_job_message"
+    assert set(deliveries[0].__slots__) == {"entry_id", "error_code"}
 
 
 async def test_acknowledge_removes_message_from_pending_list(
