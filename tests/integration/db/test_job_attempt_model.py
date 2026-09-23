@@ -1,5 +1,5 @@
 from datetime import UTC, datetime, timedelta
-from uuid import uuid7
+from uuid import UUID, uuid7
 
 import pytest
 from sqlalchemy import delete, select, text
@@ -26,15 +26,28 @@ async def create_job(database_session: AsyncSession) -> Job:
     return job
 
 
-async def test_persists_running_attempt_with_defaults(
+def make_running_attempt(
+    *,
+    job_id: UUID,
+    attempt_number: int = 1,
+    worker_id: str = "worker-1",
+) -> JobAttempt:
+    started_at = datetime(2026, 9, 22, 12, 0, tzinfo=UTC)
+    return JobAttempt(
+        job_id=job_id,
+        attempt_number=attempt_number,
+        worker_id=worker_id,
+        started_at=started_at,
+        heartbeat_at=started_at,
+        lease_expires_at=started_at + timedelta(seconds=60),
+    )
+
+
+async def test_persists_running_attempt_with_lease(
     database_session: AsyncSession,
 ) -> None:
     job = await create_job(database_session)
-    attempt = JobAttempt(
-        job_id=job.id,
-        attempt_number=1,
-        worker_id="worker-1",
-    )
+    attempt = make_running_attempt(job_id=job.id)
     database_session.add(attempt)
 
     await database_session.flush()
@@ -49,6 +62,8 @@ async def test_persists_running_attempt_with_defaults(
     assert attempt.error_code is None
     assert attempt.error_message is None
     assert attempt.started_at is not None
+    assert attempt.heartbeat_at == attempt.started_at
+    assert attempt.lease_expires_at == attempt.started_at + timedelta(seconds=60)
     assert attempt.completed_at is None
 
 
@@ -110,10 +125,9 @@ async def test_rejects_non_positive_attempt_number(
 ) -> None:
     job = await create_job(database_session)
     database_session.add(
-        JobAttempt(
+        make_running_attempt(
             job_id=job.id,
             attempt_number=attempt_number,
-            worker_id="worker-1",
         )
     )
 
@@ -128,9 +142,8 @@ async def test_rejects_blank_worker_id(
 ) -> None:
     job = await create_job(database_session)
     database_session.add(
-        JobAttempt(
+        make_running_attempt(
             job_id=job.id,
-            attempt_number=1,
             worker_id=worker_id,
         )
     )
@@ -145,12 +158,12 @@ async def test_rejects_duplicate_attempt_number_for_job(
     job = await create_job(database_session)
     database_session.add_all(
         [
-            JobAttempt(
+            make_running_attempt(
                 job_id=job.id,
                 attempt_number=1,
                 worker_id="worker-1",
             ),
-            JobAttempt(
+            make_running_attempt(
                 job_id=job.id,
                 attempt_number=1,
                 worker_id="worker-2",
@@ -170,6 +183,9 @@ async def test_rejects_duplicate_attempt_number_for_job(
             attempt_number=1,
             worker_id="worker-1",
             status=JobAttemptStatus.RUNNING,
+            started_at=datetime(2026, 9, 22, 12, 0, tzinfo=UTC),
+            heartbeat_at=datetime(2026, 9, 22, 12, 0, tzinfo=UTC),
+            lease_expires_at=datetime(2026, 9, 22, 12, 1, tzinfo=UTC),
             completed_at=datetime.now(UTC),
         ),
         JobAttempt(
@@ -219,6 +235,62 @@ async def test_rejects_completion_before_start(
         await database_session.flush()
 
 
+async def test_rejects_running_attempt_without_lease(
+    database_session: AsyncSession,
+) -> None:
+    job = await create_job(database_session)
+    database_session.add(
+        JobAttempt(
+            job_id=job.id,
+            attempt_number=1,
+            worker_id="worker-1",
+        )
+    )
+
+    with pytest.raises(IntegrityError):
+        await database_session.flush()
+
+
+@pytest.mark.parametrize(
+    ("heartbeat_offset", "expiry_offset"),
+    [
+        (0, None),
+        (None, 60),
+        (0, 0),
+        (0, -1),
+        (-1, 60),
+    ],
+)
+async def test_rejects_incomplete_or_invalid_running_lease(
+    database_session: AsyncSession,
+    heartbeat_offset: int | None,
+    expiry_offset: int | None,
+) -> None:
+    job = await create_job(database_session)
+    started_at = datetime(2026, 9, 22, 12, 0, tzinfo=UTC)
+    heartbeat_at = (
+        None
+        if heartbeat_offset is None
+        else started_at + timedelta(seconds=heartbeat_offset)
+    )
+    lease_expires_at = (
+        None if expiry_offset is None else started_at + timedelta(seconds=expiry_offset)
+    )
+    database_session.add(
+        JobAttempt(
+            job_id=job.id,
+            attempt_number=1,
+            worker_id="worker-1",
+            started_at=started_at,
+            heartbeat_at=heartbeat_at,
+            lease_expires_at=lease_expires_at,
+        )
+    )
+
+    with pytest.raises(IntegrityError):
+        await database_session.flush()
+
+
 async def test_database_rejects_invalid_attempt_status(
     database_session: AsyncSession,
 ) -> None:
@@ -252,11 +324,7 @@ async def test_deleting_job_cascades_to_attempts(
     database_session: AsyncSession,
 ) -> None:
     job = await create_job(database_session)
-    attempt = JobAttempt(
-        job_id=job.id,
-        attempt_number=1,
-        worker_id="worker-1",
-    )
+    attempt = make_running_attempt(job_id=job.id)
     database_session.add(attempt)
     await database_session.flush()
     attempt_id = attempt.id

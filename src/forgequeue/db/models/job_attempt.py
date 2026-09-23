@@ -55,12 +55,29 @@ class JobAttempt(Base):
             "completed_at IS NULL OR completed_at >= started_at",
             name="ck_job_attempts_completion_not_before_start",
         ),
+        CheckConstraint(
+            "status <> 'RUNNING' OR "
+            "(heartbeat_at IS NOT NULL AND lease_expires_at IS NOT NULL)",
+            name="ck_job_attempts_running_has_lease",
+        ),
+        CheckConstraint(
+            "(heartbeat_at IS NULL AND lease_expires_at IS NULL) OR "
+            "(heartbeat_at IS NOT NULL AND lease_expires_at IS NOT NULL "
+            "AND heartbeat_at >= started_at "
+            "AND lease_expires_at > heartbeat_at)",
+            name="ck_job_attempts_lease_order",
+        ),
         UniqueConstraint(
             "job_id",
             "attempt_number",
             name="uq_job_attempts_job_id_attempt_number",
         ),
         Index("ix_job_attempts_status_started_at", "status", "started_at"),
+        Index(
+            "ix_job_attempts_status_lease_expires_at",
+            "status",
+            "lease_expires_at",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(
@@ -115,6 +132,14 @@ class JobAttempt(Base):
         DateTime(timezone=True),
         server_default=func.now(),
         nullable=False,
+    )
+    heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
     )
     completed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),

@@ -1,6 +1,7 @@
 import asyncio
 import signal
 from collections.abc import Callable
+from datetime import timedelta
 from typing import Protocol
 
 from redis.asyncio import Redis
@@ -17,7 +18,9 @@ from forgequeue.db.session import (
     create_database_engine,
     create_session_factory,
 )
+from forgequeue.jobs.leases import AttemptLeasePolicy
 from forgequeue.worker.processor import JobProcessor
+from forgequeue.worker.recovery import PeriodicRecovery, ReclaimedDeliveryCoordinator
 from forgequeue.worker.runner import Worker
 
 
@@ -58,8 +61,28 @@ def create_worker(
         broker,
         dead_letter_broker,
         session_factory,
+        lease_policy=AttemptLeasePolicy(
+            duration=timedelta(seconds=settings.worker_lease_duration_seconds),
+            heartbeat_interval=timedelta(
+                seconds=settings.worker_heartbeat_interval_seconds
+            ),
+        ),
     )
-    return Worker(broker, processor)
+    recovery = PeriodicRecovery(
+        ReclaimedDeliveryCoordinator(
+            broker,
+            processor,
+            session_factory,
+        ),
+        min_idle_ms=settings.worker_recovery_min_idle_ms,
+        batch_size=settings.worker_recovery_batch_size,
+        poll_interval_seconds=settings.worker_recovery_poll_seconds,
+    )
+    return Worker(
+        broker,
+        processor,
+        recovery=recovery,
+    )
 
 
 async def run_worker() -> None:

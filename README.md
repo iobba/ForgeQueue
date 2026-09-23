@@ -29,6 +29,10 @@ job asynchronously, and clients can retrieve its current status and result
 through the API. Retryable failures receive a durable future timestamp; a
 separate dispatcher publishes them back to Redis when they become due.
 
+Workers renew a lease while processing each job attempt. If a worker stops
+renewing it, another worker can reclaim the pending delivery and retry or fail
+the job according to its retry policy.
+
 ```text
 Client
   |

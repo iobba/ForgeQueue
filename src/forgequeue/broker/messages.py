@@ -79,6 +79,13 @@ type JobDelivery = ReceivedJobMessage | MalformedJobDelivery
 
 
 @dataclass(frozen=True, slots=True)
+class ClaimedDeliveryBatch:
+    next_start_id: str
+    deliveries: list[JobDelivery]
+    deleted_entry_ids: list[str]
+
+
+@dataclass(frozen=True, slots=True)
 class ReceivedDeadLetterMessage:
     entry_id: str
     message: DeadLetterMessage

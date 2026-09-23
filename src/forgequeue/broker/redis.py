@@ -1,3 +1,4 @@
+import re
 from typing import cast
 
 from pydantic import ValidationError
@@ -6,6 +7,7 @@ from redis.exceptions import ResponseError
 from redis.typing import EncodableT, FieldT, KeyT, StreamIdT
 
 from forgequeue.broker.messages import (
+    ClaimedDeliveryBatch,
     DeadLetterMessage,
     JobDelivery,
     JobMessage,
@@ -18,6 +20,13 @@ from forgequeue.core.config import Settings
 
 type RawStreamEntry = tuple[bytes | str, dict[bytes | str, bytes | str]]
 type RawStreamResponse = tuple[bytes | str, list[RawStreamEntry]]
+type RawAutoClaimResponse = tuple[
+    bytes | str,
+    list[RawStreamEntry],
+    list[bytes | str],
+]
+
+STREAM_ID_PATTERN = re.compile(r"\d+-\d+")
 
 
 def decode_redis_value(value: bytes | str) -> str:
@@ -106,24 +115,50 @@ class RedisJobBroker:
 
         for _, entries in stream_responses:
             for entry_id, fields in entries:
-                decoded_entry_id = decode_redis_value(entry_id)
-                try:
-                    decoded_fields = {
-                        decode_redis_value(key): decode_redis_value(value)
-                        for key, value in fields.items()
-                    }
-                    received_messages.append(
-                        ReceivedJobMessage(
-                            entry_id=decoded_entry_id,
-                            message=JobMessage.model_validate(decoded_fields),
-                        )
-                    )
-                except UnicodeDecodeError, ValidationError:
-                    received_messages.append(
-                        MalformedJobDelivery(entry_id=decoded_entry_id)
-                    )
+                received_messages.append(self._decode_delivery(entry_id, fields))
 
         return received_messages
+
+    async def claim_stale(
+        self,
+        *,
+        consumer_name: str,
+        min_idle_ms: int,
+        start_id: str = "0-0",  # start from the beginning of the PEL
+        count: int = 10,
+    ) -> ClaimedDeliveryBatch:
+        if not consumer_name.strip():
+            raise ValueError("consumer_name must not be blank")
+        if min_idle_ms < 0:
+            raise ValueError("min_idle_ms must not be negative")
+        if not STREAM_ID_PATTERN.fullmatch(start_id):
+            raise ValueError("start_id must be a Redis stream ID")
+        if count < 1:
+            raise ValueError("count must be at least 1")
+
+        response = cast(
+            RawAutoClaimResponse,
+            await self._client.xautoclaim(
+                name=self._stream_name,
+                groupname=self._group_name,
+                consumername=consumer_name,
+                min_idle_time=min_idle_ms,
+                start_id=start_id,
+                count=count,
+                justid=False,
+            ),
+        )
+        next_start_id, entries, deleted_entry_ids = response
+
+        return ClaimedDeliveryBatch(
+            next_start_id=decode_redis_value(next_start_id),
+            deliveries=[
+                self._decode_delivery(entry_id, fields) for entry_id, fields in entries
+            ],
+            deleted_entry_ids=[
+                decode_redis_value(entry_id) for entry_id in deleted_entry_ids
+            ],
+        )
 
     async def acknowledge(self, entry_id: str) -> int:
         if not entry_id.strip():
@@ -168,6 +203,24 @@ class RedisJobBroker:
             )
             for entry in entries
         ]
+
+    @staticmethod
+    def _decode_delivery(
+        entry_id: bytes | str,
+        fields: dict[bytes | str, bytes | str],
+    ) -> JobDelivery:
+        decoded_entry_id = decode_redis_value(entry_id)
+        try:
+            decoded_fields = {
+                decode_redis_value(key): decode_redis_value(value)
+                for key, value in fields.items()
+            }
+            return ReceivedJobMessage(
+                entry_id=decoded_entry_id,
+                message=JobMessage.model_validate(decoded_fields),
+            )
+        except UnicodeDecodeError, ValidationError:
+            return MalformedJobDelivery(entry_id=decoded_entry_id)
 
 
 class RedisDeadLetterBroker:

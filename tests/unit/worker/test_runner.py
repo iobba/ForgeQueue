@@ -13,7 +13,8 @@ from forgequeue.broker.messages import (
 )
 from forgequeue.broker.redis import RedisJobBroker
 from forgequeue.worker.processor import JobProcessor
-from forgequeue.worker.runner import Worker, generate_worker_id
+from forgequeue.worker.recovery import RecoveryBatchResult
+from forgequeue.worker.runner import Worker, WorkerRecovery, generate_worker_id
 
 pytestmark = pytest.mark.unit
 
@@ -93,6 +94,34 @@ class FakeProcessor:
             raise self.error
 
 
+class FakeRecovery:
+    def __init__(
+        self,
+        error: Exception | None = None,
+        *,
+        stop_event: asyncio.Event | None = None,
+    ) -> None:
+        self.error = error
+        self.stop_event = stop_event
+        self.worker_ids: list[str] = []
+
+    async def run_if_due(
+        self,
+        *,
+        worker_id: str,
+    ) -> RecoveryBatchResult | None:
+        self.worker_ids.append(worker_id)
+        if self.error is not None:
+            raise self.error
+        if self.stop_event is not None:
+            self.stop_event.set()
+        return RecoveryBatchResult(
+            next_start_id="0-0",
+            outcomes=[],
+            deleted_entry_ids=[],
+        )
+
+
 def build_worker(
     *,
     deliveries: list[JobDelivery] | None = None,
@@ -101,6 +130,7 @@ def build_worker(
     stop_event: asyncio.Event | None = None,
     stop_after_reads: int | None = None,
     worker_id: str | None = "worker-test",
+    recovery: WorkerRecovery | None = None,
 ) -> tuple[Worker, FakeBroker, FakeProcessor]:
     broker = FakeBroker(
         deliveries,
@@ -113,6 +143,7 @@ def build_worker(
         cast(RedisJobBroker, broker),
         cast(JobProcessor, processor),
         worker_id=worker_id,
+        recovery=recovery,
     )
     return worker, broker, processor
 
@@ -248,6 +279,48 @@ async def test_run_forever_reuses_identity_until_stop_is_requested() -> None:
         ReadCall(consumer_name="worker-loop", count=1, block_ms=25),
         ReadCall(consumer_name="worker-loop", count=1, block_ms=25),
     ]
+
+
+@pytest.mark.asyncio
+async def test_run_forever_checks_recovery_before_each_read() -> None:
+    stop_event = asyncio.Event()
+    recovery = FakeRecovery()
+    worker, broker, _ = build_worker(
+        stop_event=stop_event,
+        stop_after_reads=2,
+        worker_id="worker-loop",
+        recovery=recovery,
+    )
+
+    await worker.run_forever(stop_event, block_ms=25)
+
+    assert recovery.worker_ids == ["worker-loop", "worker-loop"]
+    assert len(broker.read_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_run_forever_propagates_recovery_exception_before_reading() -> None:
+    recovery = FakeRecovery(ConnectionError("recovery unavailable"))
+    worker, broker, processor = build_worker(recovery=recovery)
+
+    with pytest.raises(ConnectionError, match="recovery unavailable"):
+        await worker.run_forever(asyncio.Event(), block_ms=None)
+
+    assert broker.ensure_consumer_group_calls == 1
+    assert broker.read_calls == []
+    assert processor.processed_deliveries == []
+
+
+@pytest.mark.asyncio
+async def test_run_forever_does_not_read_after_stop_during_recovery() -> None:
+    stop_event = asyncio.Event()
+    recovery = FakeRecovery(stop_event=stop_event)
+    worker, broker, _ = build_worker(recovery=recovery)
+
+    await worker.run_forever(stop_event, block_ms=None)
+
+    assert recovery.worker_ids == ["worker-test"]
+    assert broker.read_calls == []
 
 
 @pytest.mark.asyncio

@@ -450,3 +450,201 @@ async def test_list_pending_excludes_acknowledged_delivery(
     await broker.acknowledge(received_messages[0].entry_id)
 
     assert await broker.list_pending() == []
+
+
+async def test_claim_stale_transfers_delivery_to_new_consumer(
+    redis_broker: RedisBrokerFixture,
+) -> None:
+    _, broker, _, _ = redis_broker
+    message = JobMessage(job_id=uuid7(), job_type="sum_numbers")
+    entry_id = await broker.publish(message)
+    await broker.ensure_consumer_group()
+    await broker.read(consumer_name="worker-one", block_ms=None)
+
+    claimed_batch = await broker.claim_stale(
+        consumer_name="worker-two",
+        min_idle_ms=0,
+    )
+
+    assert claimed_batch.deliveries == [
+        ReceivedJobMessage(entry_id=entry_id, message=message)
+    ]
+    assert claimed_batch.deleted_entry_ids == []
+    pending_deliveries = await broker.list_pending()
+    assert len(pending_deliveries) == 1
+    assert pending_deliveries[0] == PendingJobDelivery(
+        entry_id=entry_id,
+        consumer_name="worker-two",
+        idle_ms=pending_deliveries[0].idle_ms,
+        delivery_count=2,
+    )
+    assert pending_deliveries[0].idle_ms >= 0
+
+
+async def test_claim_stale_does_not_claim_delivery_below_idle_threshold(
+    redis_broker: RedisBrokerFixture,
+) -> None:
+    _, broker, _, _ = redis_broker
+    await broker.publish(JobMessage(job_id=uuid7(), job_type="sum_numbers"))
+    await broker.ensure_consumer_group()
+    await broker.read(consumer_name="worker-one", block_ms=None)
+
+    claimed_batch = await broker.claim_stale(
+        consumer_name="worker-two",
+        min_idle_ms=60_000,
+    )
+
+    assert claimed_batch.deliveries == []
+    assert claimed_batch.deleted_entry_ids == []
+    pending_deliveries = await broker.list_pending()
+    assert len(pending_deliveries) == 1
+    assert pending_deliveries[0].consumer_name == "worker-one"
+    assert pending_deliveries[0].delivery_count == 1
+
+
+async def test_claim_stale_respects_count_and_returns_scan_cursor(
+    redis_broker: RedisBrokerFixture,
+) -> None:
+    _, broker, _, _ = redis_broker
+    messages = [JobMessage(job_id=uuid7(), job_type="sum_numbers") for _ in range(3)]
+    for message in messages:
+        await broker.publish(message)
+    await broker.ensure_consumer_group()
+    original_deliveries = await broker.read(
+        consumer_name="worker-one",
+        count=3,
+        block_ms=None,
+    )
+
+    first_batch = await broker.claim_stale(
+        consumer_name="worker-two",
+        min_idle_ms=0,
+        count=1,
+    )
+    second_batch = await broker.claim_stale(
+        consumer_name="worker-two",
+        min_idle_ms=0,
+        start_id=first_batch.next_start_id,
+        count=2,
+    )
+
+    assert len(first_batch.deliveries) == 1
+    assert first_batch.next_start_id != "0-0"
+    assert (
+        second_batch.next_start_id == "0-0"
+    )  # this means the scan has reached the end
+    assert [delivery.entry_id for delivery in first_batch.deliveries] == [
+        original_deliveries[0].entry_id
+    ]
+    assert [delivery.entry_id for delivery in second_batch.deliveries] == [
+        delivery.entry_id for delivery in original_deliveries[1:]
+    ]
+
+
+async def test_claim_stale_decodes_malformed_delivery(
+    redis_broker: RedisBrokerFixture,
+) -> None:
+    redis_client, broker, stream_name, _ = redis_broker
+    invalid_fields: dict[FieldT, EncodableT] = {
+        "schema_version": "2",
+        "job_id": str(uuid7()),
+        "job_type": "sum_numbers",
+    }
+    entry_id = cast(str, await redis_client.xadd(stream_name, invalid_fields))
+    await broker.ensure_consumer_group()
+    await broker.read(consumer_name="worker-one", block_ms=None)
+
+    claimed_batch = await broker.claim_stale(
+        consumer_name="worker-two",
+        min_idle_ms=0,
+    )
+
+    assert claimed_batch.deliveries == [MalformedJobDelivery(entry_id=entry_id)]
+
+
+async def test_claim_stale_does_not_acknowledge_claimed_delivery(
+    redis_broker: RedisBrokerFixture,
+) -> None:
+    _, broker, _, _ = redis_broker
+    await broker.publish(JobMessage(job_id=uuid7(), job_type="sum_numbers"))
+    await broker.ensure_consumer_group()
+    await broker.read(consumer_name="worker-one", block_ms=None)
+
+    claimed_batch = await broker.claim_stale(
+        consumer_name="worker-two",
+        min_idle_ms=0,
+    )
+
+    assert len(claimed_batch.deliveries) == 1
+    pending_deliveries = await broker.list_pending()
+    assert len(pending_deliveries) == 1
+    assert pending_deliveries[0].entry_id == claimed_batch.deliveries[0].entry_id
+
+
+async def test_claim_stale_reports_deleted_pending_entry_ids(
+    redis_broker: RedisBrokerFixture,
+) -> None:
+    redis_client, broker, stream_name, _ = redis_broker
+    entry_id = await broker.publish(JobMessage(job_id=uuid7(), job_type="sum_numbers"))
+    await broker.ensure_consumer_group()
+    await broker.read(consumer_name="worker-one", block_ms=None)
+    assert await redis_client.xdel(stream_name, entry_id) == 1
+
+    claimed_batch = await broker.claim_stale(
+        consumer_name="worker-two",
+        min_idle_ms=0,
+    )
+
+    assert claimed_batch.deliveries == []
+    assert claimed_batch.deleted_entry_ids == [entry_id]
+    assert await broker.list_pending() == []
+
+
+@pytest.mark.parametrize("consumer_name", ["", " "])
+async def test_claim_stale_rejects_blank_consumer_name(
+    redis_broker: RedisBrokerFixture,
+    consumer_name: str,
+) -> None:
+    _, broker, _, _ = redis_broker
+
+    with pytest.raises(ValueError, match="consumer_name must not be blank"):
+        await broker.claim_stale(consumer_name=consumer_name, min_idle_ms=0)
+
+
+async def test_claim_stale_rejects_negative_idle_threshold(
+    redis_broker: RedisBrokerFixture,
+) -> None:
+    _, broker, _, _ = redis_broker
+
+    with pytest.raises(ValueError, match="min_idle_ms must not be negative"):
+        await broker.claim_stale(consumer_name="worker-two", min_idle_ms=-1)
+
+
+@pytest.mark.parametrize("start_id", ["", " ", "not-a-stream-id", "1-"])
+async def test_claim_stale_rejects_invalid_start_id(
+    redis_broker: RedisBrokerFixture,
+    start_id: str,
+) -> None:
+    _, broker, _, _ = redis_broker
+
+    with pytest.raises(ValueError, match="start_id must be a Redis stream ID"):
+        await broker.claim_stale(
+            consumer_name="worker-two",
+            min_idle_ms=0,
+            start_id=start_id,
+        )
+
+
+@pytest.mark.parametrize("count", [0, -1])
+async def test_claim_stale_rejects_non_positive_count(
+    redis_broker: RedisBrokerFixture,
+    count: int,
+) -> None:
+    _, broker, _, _ = redis_broker
+
+    with pytest.raises(ValueError, match="count must be at least 1"):
+        await broker.claim_stale(
+            consumer_name="worker-two",
+            min_idle_ms=0,
+            count=count,
+        )

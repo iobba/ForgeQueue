@@ -1,6 +1,9 @@
+import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from threading import Event
+from time import sleep
 from typing import cast
 from uuid import UUID, uuid7
 
@@ -16,8 +19,13 @@ from forgequeue.broker.messages import JobMessage
 from forgequeue.broker.redis import RedisDeadLetterBroker, RedisJobBroker
 from forgequeue.db.models import Job
 from forgequeue.jobs.attempt_repository import JobAttemptRepository
+from forgequeue.jobs.attempt_service import (
+    AttemptLeaseFinalizationRejectedError,
+    AttemptLeaseRenewalRejectedError,
+)
 from forgequeue.jobs.attempts import JobAttemptStatus, JobFailureKind
 from forgequeue.jobs.execution_errors import RetryableJobError
+from forgequeue.jobs.leases import AttemptLease, AttemptLeasePolicy
 from forgequeue.jobs.repository import JobRepository
 from forgequeue.jobs.retry_policy import RetryPolicy
 from forgequeue.jobs.service import JobService
@@ -149,9 +157,250 @@ async def test_process_completes_job_and_acknowledges_delivery(
         assert attempts[0].worker_id == "worker-one"
         assert attempts[0].status is JobAttemptStatus.SUCCEEDED
         assert attempts[0].completed_at is not None
+        assert attempts[0].heartbeat_at == attempts[0].started_at
+        assert attempts[0].lease_expires_at is not None
+        assert attempts[0].heartbeat_at is not None
+        assert attempts[0].lease_expires_at - attempts[0].heartbeat_at == (
+            timedelta(seconds=60)
+        )
 
     assert deliveries[0].entry_id == entry_id
     assert await processor_environment.broker.list_pending() == []
+    assert await read_dead_letter_entries(processor_environment) == []
+
+
+async def test_process_renews_lease_while_handler_is_running(
+    processor_environment: ProcessorTestEnvironment,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_id = await create_persisted_job(processor_environment)
+    await processor_environment.broker.ensure_consumer_group()
+    await processor_environment.broker.publish(
+        JobMessage(job_id=job_id, job_type="sum_numbers")
+    )
+    deliveries = await processor_environment.broker.read(
+        consumer_name="worker-one",
+        block_ms=None,
+    )
+
+    def slow_handler(payload: dict[str, object]) -> dict[str, object]:
+        del payload
+        sleep(0.08)
+        return {"sum": 60}
+
+    def get_slow_handler(job_type: str) -> JobHandler:
+        del job_type
+        return slow_handler
+
+    monkeypatch.setattr(processor_module, "get_handler", get_slow_handler)
+    lease_policy = AttemptLeasePolicy(
+        duration=timedelta(milliseconds=500),
+        heartbeat_interval=timedelta(milliseconds=10),
+    )
+    processor = JobProcessor(
+        processor_environment.broker,
+        RedisDeadLetterBroker(
+            processor_environment.redis_client,
+            stream_name=processor_environment.dead_letter_stream_name,
+        ),
+        processor_environment.session_factory,
+        lease_policy=lease_policy,
+    )
+
+    await processor.process(deliveries[0], worker_id="worker-one")
+
+    async with processor_environment.session_factory() as session:
+        attempts = await JobAttemptRepository(session).list_for_job(job_id)
+
+    assert len(attempts) == 1
+    assert attempts[0].status is JobAttemptStatus.SUCCEEDED
+    assert attempts[0].heartbeat_at is not None
+    assert attempts[0].heartbeat_at > attempts[0].started_at
+    assert attempts[0].lease_expires_at == (
+        attempts[0].heartbeat_at + lease_policy.duration
+    )
+    assert await processor_environment.broker.list_pending() == []
+
+
+async def test_process_leaves_delivery_pending_when_lease_renewal_is_rejected(
+    processor_environment: ProcessorTestEnvironment,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_id = await create_persisted_job(processor_environment)
+    await processor_environment.broker.ensure_consumer_group()
+    await processor_environment.broker.publish(
+        JobMessage(job_id=job_id, job_type="sum_numbers")
+    )
+    deliveries = await processor_environment.broker.read(
+        consumer_name="worker-one",
+        block_ms=None,
+    )
+    handler_completed = Event()
+
+    def slow_handler(payload: dict[str, object]) -> dict[str, object]:
+        del payload
+        try:
+            sleep(0.05)
+            return {"sum": 60}
+        finally:
+            handler_completed.set()
+
+    async def reject_renewal(
+        repository: JobAttemptRepository,
+        *,
+        attempt_id: UUID,
+        worker_id: str,
+        current_lease: AttemptLease,
+        renewed_lease: AttemptLease,
+    ) -> None:
+        del (
+            repository,
+            attempt_id,
+            worker_id,
+            current_lease,
+            renewed_lease,
+        )
+        return None
+
+    def get_slow_handler(job_type: str) -> JobHandler:
+        del job_type
+        return slow_handler
+
+    monkeypatch.setattr(processor_module, "get_handler", get_slow_handler)
+    monkeypatch.setattr(JobAttemptRepository, "renew_lease", reject_renewal)
+    processor = JobProcessor(
+        processor_environment.broker,
+        RedisDeadLetterBroker(
+            processor_environment.redis_client,
+            stream_name=processor_environment.dead_letter_stream_name,
+        ),
+        processor_environment.session_factory,
+        lease_policy=AttemptLeasePolicy(
+            duration=timedelta(milliseconds=500),
+            heartbeat_interval=timedelta(milliseconds=10),
+        ),
+    )
+
+    with pytest.raises(AttemptLeaseRenewalRejectedError):
+        await processor.process(deliveries[0], worker_id="worker-one")
+
+    assert await asyncio.to_thread(handler_completed.wait, 1)
+    async with processor_environment.session_factory() as session:
+        persisted_job = await JobRepository(session).get(job_id)
+        attempts = await JobAttemptRepository(session).list_for_job(job_id)
+
+    assert persisted_job is not None
+    assert persisted_job.status is JobStatus.RUNNING
+    assert len(attempts) == 1
+    assert attempts[0].status is JobAttemptStatus.RUNNING
+    assert [
+        pending.entry_id
+        for pending in await processor_environment.broker.list_pending()
+    ] == [deliveries[0].entry_id]
+
+
+async def test_process_rejects_success_after_lease_ownership_is_lost(
+    processor_environment: ProcessorTestEnvironment,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_id = await create_persisted_job(processor_environment)
+    await processor_environment.broker.ensure_consumer_group()
+    await processor_environment.broker.publish(
+        JobMessage(job_id=job_id, job_type="sum_numbers")
+    )
+    deliveries = await processor_environment.broker.read(
+        consumer_name="worker-one",
+        block_ms=None,
+    )
+
+    async def reject_success(
+        repository: JobAttemptRepository,
+        *,
+        attempt_id: UUID,
+        worker_id: str,
+        current_lease: AttemptLease,
+        completed_at: datetime,
+    ) -> None:
+        del repository, attempt_id, worker_id, current_lease, completed_at
+        return None
+
+    monkeypatch.setattr(JobAttemptRepository, "succeed_if_owned", reject_success)
+
+    with pytest.raises(AttemptLeaseFinalizationRejectedError):
+        await processor_environment.processor.process(
+            deliveries[0],
+            worker_id="worker-one",
+        )
+
+    async with processor_environment.session_factory() as session:
+        persisted_job = await JobRepository(session).get(job_id)
+        attempts = await JobAttemptRepository(session).list_for_job(job_id)
+
+    assert persisted_job is not None
+    assert persisted_job.status is JobStatus.RUNNING
+    assert len(attempts) == 1
+    assert attempts[0].status is JobAttemptStatus.RUNNING
+    assert len(await processor_environment.broker.list_pending()) == 1
+
+
+async def test_process_rejects_failure_after_lease_ownership_is_lost(
+    processor_environment: ProcessorTestEnvironment,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job_id = await create_persisted_job(
+        processor_environment,
+        job_type="generate_report",
+        payload={"customer_id": 42},
+    )
+    await processor_environment.broker.ensure_consumer_group()
+    await processor_environment.broker.publish(
+        JobMessage(job_id=job_id, job_type="generate_report")
+    )
+    deliveries = await processor_environment.broker.read(
+        consumer_name="worker-one",
+        block_ms=None,
+    )
+
+    async def reject_failure(
+        repository: JobAttemptRepository,
+        *,
+        attempt_id: UUID,
+        worker_id: str,
+        current_lease: AttemptLease,
+        failure_kind: JobFailureKind,
+        error_code: str,
+        error_message: str,
+        completed_at: datetime,
+    ) -> None:
+        del (
+            repository,
+            attempt_id,
+            worker_id,
+            current_lease,
+            failure_kind,
+            error_code,
+            error_message,
+            completed_at,
+        )
+        return None
+
+    monkeypatch.setattr(JobAttemptRepository, "fail_if_owned", reject_failure)
+
+    with pytest.raises(AttemptLeaseFinalizationRejectedError):
+        await processor_environment.processor.process(
+            deliveries[0],
+            worker_id="worker-one",
+        )
+
+    async with processor_environment.session_factory() as session:
+        persisted_job = await JobRepository(session).get(job_id)
+        attempts = await JobAttemptRepository(session).list_for_job(job_id)
+
+    assert persisted_job is not None
+    assert persisted_job.status is JobStatus.RUNNING
+    assert len(attempts) == 1
+    assert attempts[0].status is JobAttemptStatus.RUNNING
+    assert len(await processor_environment.broker.list_pending()) == 1
     assert await read_dead_letter_entries(processor_environment) == []
 
 
@@ -457,6 +706,8 @@ async def test_process_schedules_retryable_failure_with_backoff_and_acknowledges
         assert attempts[0].failure_kind is JobFailureKind.RETRYABLE
         assert attempts[0].error_code == "dependency_unavailable"
         assert attempts[0].completed_at is not None
+        assert attempts[0].heartbeat_at == scheduled_at
+        assert attempts[0].lease_expires_at == scheduled_at + timedelta(seconds=60)
 
     assert await processor_environment.broker.list_pending() == []
     assert await read_dead_letter_entries(processor_environment) == []

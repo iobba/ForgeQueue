@@ -33,6 +33,24 @@ class Settings(BaseSettings):
     redis_socket_timeout_seconds: float = Field(default=5.0, gt=0)
     redis_worker_block_ms: int = Field(default=1_000, ge=1)
 
+    worker_recovery_min_idle_ms: int = Field(default=60_000, ge=1)
+    worker_recovery_batch_size: int = Field(default=10, ge=1, le=1_000)
+    worker_recovery_poll_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        allow_inf_nan=False,
+    )
+    worker_lease_duration_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        allow_inf_nan=False,
+    )
+    worker_heartbeat_interval_seconds: float = Field(
+        default=15.0,
+        gt=0,
+        allow_inf_nan=False,
+    )
+
     retry_dispatcher_batch_size: int = Field(default=100, ge=1, le=1_000)
     retry_dispatcher_poll_seconds: float = Field(
         default=1.0,
@@ -57,6 +75,12 @@ class Settings(BaseSettings):
             raise ValueError(
                 "redis_worker_block_ms must be shorter than "
                 "redis_socket_timeout_seconds"
+            )
+
+        if self.worker_heartbeat_interval_seconds >= self.worker_lease_duration_seconds:
+            raise ValueError(
+                "worker_heartbeat_interval_seconds must be shorter than "
+                "worker_lease_duration_seconds"
             )
 
         return self
