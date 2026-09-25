@@ -43,6 +43,7 @@ async def test_publish_failure_leaves_committed_job_queued(
 
     message = broker.published_message
     assert message is not None
+    assert message.attempt_number == 1
 
     try:
         async with database_session_factory() as session:

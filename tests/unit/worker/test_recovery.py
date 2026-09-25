@@ -77,6 +77,65 @@ def test_queued_job_is_safe_to_process() -> None:
     )
 
 
+def test_queued_retry_processes_only_its_current_delivery() -> None:
+    decision = decide_reclaimed_delivery(
+        message_job_type="sum_numbers",
+        message_attempt_number=2,
+        job_status=JobStatus.QUEUED,
+        database_job_type="sum_numbers",
+        job_attempts=1,
+    )
+
+    assert decision == ReclaimedDeliveryDecision(
+        action=ReclaimedDeliveryAction.PROCESS,
+        reason=ReclaimedDeliveryReason.JOB_READY,
+    )
+
+
+def test_queued_retry_acknowledges_delivery_from_previous_attempt() -> None:
+    decision = decide_reclaimed_delivery(
+        message_job_type="sum_numbers",
+        message_attempt_number=1,
+        job_status=JobStatus.QUEUED,
+        database_job_type="sum_numbers",
+        job_attempts=1,
+    )
+
+    assert decision == ReclaimedDeliveryDecision(
+        action=ReclaimedDeliveryAction.ACKNOWLEDGE,
+        reason=ReclaimedDeliveryReason.STALE_ATTEMPT,
+    )
+
+
+def test_queued_retry_leaves_legacy_delivery_without_attempt_number_pending() -> None:
+    decision = decide_reclaimed_delivery(
+        message_job_type="sum_numbers",
+        job_status=JobStatus.QUEUED,
+        database_job_type="sum_numbers",
+        job_attempts=1,
+    )
+
+    assert decision == ReclaimedDeliveryDecision(
+        action=ReclaimedDeliveryAction.LEAVE_PENDING,
+        reason=ReclaimedDeliveryReason.LEGACY_ATTEMPT_AMBIGUOUS,
+    )
+
+
+def test_queued_job_leaves_future_attempt_pending() -> None:
+    decision = decide_reclaimed_delivery(
+        message_job_type="sum_numbers",
+        message_attempt_number=2,
+        job_status=JobStatus.QUEUED,
+        database_job_type="sum_numbers",
+        job_attempts=0,
+    )
+
+    assert decision == ReclaimedDeliveryDecision(
+        action=ReclaimedDeliveryAction.LEAVE_PENDING,
+        reason=ReclaimedDeliveryReason.FUTURE_ATTEMPT,
+    )
+
+
 @pytest.mark.parametrize("job_status", [JobStatus.COMPLETED, JobStatus.FAILED])
 def test_terminal_job_delivery_is_safe_to_acknowledge(job_status: JobStatus) -> None:
     decision = decide_reclaimed_delivery(

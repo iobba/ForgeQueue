@@ -64,6 +64,7 @@ class RetryDispatcher:
                         JobMessage(
                             job_id=job.id,
                             job_type=job.job_type,
+                            attempt_number=job.attempts + 1,
                         )
                     )
                     await service.queue_retry(job.id, queued_at=due_at)

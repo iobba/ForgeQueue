@@ -31,6 +31,9 @@ class ReclaimedDeliveryAction(StrEnum):
 
 class ReclaimedDeliveryReason(StrEnum):
     JOB_READY = "job_ready"
+    STALE_ATTEMPT = "stale_attempt"
+    FUTURE_ATTEMPT = "future_attempt"
+    LEGACY_ATTEMPT_AMBIGUOUS = "legacy_attempt_ambiguous"
     JOB_LEASE_EXPIRED = "job_lease_expired"
     JOB_TERMINAL = "job_terminal"
     JOB_RUNNING = "job_running"
@@ -75,6 +78,8 @@ def decide_reclaimed_delivery(
     message_job_type: str,
     job_status: JobStatus | None,
     database_job_type: str | None,
+    message_attempt_number: int | None = None,
+    job_attempts: int = 0,
     running_attempt_lease_expired: bool = False,
 ) -> ReclaimedDeliveryDecision:
     if job_status is None or database_job_type is None:
@@ -91,6 +96,28 @@ def decide_reclaimed_delivery(
 
     match job_status:
         case JobStatus.QUEUED:
+            expected_attempt_number = job_attempts + 1
+            if message_attempt_number is None and job_attempts > 0:
+                return ReclaimedDeliveryDecision(
+                    action=ReclaimedDeliveryAction.LEAVE_PENDING,
+                    reason=ReclaimedDeliveryReason.LEGACY_ATTEMPT_AMBIGUOUS,
+                )
+            if (
+                message_attempt_number is not None
+                and message_attempt_number < expected_attempt_number
+            ):
+                return ReclaimedDeliveryDecision(
+                    action=ReclaimedDeliveryAction.ACKNOWLEDGE,
+                    reason=ReclaimedDeliveryReason.STALE_ATTEMPT,
+                )
+            if (
+                message_attempt_number is not None
+                and message_attempt_number > expected_attempt_number
+            ):
+                return ReclaimedDeliveryDecision(
+                    action=ReclaimedDeliveryAction.LEAVE_PENDING,
+                    reason=ReclaimedDeliveryReason.FUTURE_ATTEMPT,
+                )
             return ReclaimedDeliveryDecision(
                 action=ReclaimedDeliveryAction.PROCESS,
                 reason=ReclaimedDeliveryReason.JOB_READY,
@@ -184,8 +211,10 @@ class ReclaimedDeliveryCoordinator:
 
         decision = decide_reclaimed_delivery(
             message_job_type=delivery.message.job_type,
+            message_attempt_number=delivery.message.attempt_number,
             job_status=job_status,
             database_job_type=database_job_type,
+            job_attempts=job.attempts if job is not None else 0,
             running_attempt_lease_expired=running_attempt_lease_expired,
         )
 

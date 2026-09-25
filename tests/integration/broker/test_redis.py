@@ -139,6 +139,28 @@ async def test_publish_stores_the_exact_message_fields(
     ]
 
 
+async def test_publish_stores_attempt_number_for_new_deliveries(
+    redis_broker: RedisBrokerFixture,
+) -> None:
+    redis_client, broker, stream_name, _ = redis_broker
+    message = JobMessage(job_id=uuid7(), job_type="sum_numbers", attempt_number=2)
+
+    entry_id = await broker.publish(message)
+    entries = await read_stream_entries(redis_client, stream_name)
+
+    assert entries == [
+        (
+            entry_id,
+            {
+                "schema_version": "1",
+                "job_id": str(message.job_id),
+                "job_type": "sum_numbers",
+                "attempt_number": "2",
+            },
+        )
+    ]
+
+
 async def test_publish_appends_messages_without_replacing_existing_entries(
     redis_broker: RedisBrokerFixture,
 ) -> None:

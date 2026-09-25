@@ -76,6 +76,8 @@ class RedisJobBroker:
             "job_id": str(message.job_id),
             "job_type": message.job_type,
         }
+        if message.attempt_number is not None:
+            fields["attempt_number"] = message.attempt_number
 
         message_id = await self._client.xadd(
             name=self._stream_name,

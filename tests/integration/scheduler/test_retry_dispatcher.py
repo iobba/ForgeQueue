@@ -121,6 +121,7 @@ async def test_run_once_publishes_only_due_retries_and_marks_them_queued(
         assert deliveries[0].message == JobMessage(
             job_id=due_job_id,
             job_type="sum_numbers",
+            attempt_number=2,
         )
         assert due_job is not None
         assert due_job.status is JobStatus.QUEUED

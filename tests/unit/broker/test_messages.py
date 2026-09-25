@@ -23,6 +23,7 @@ def test_job_message_accepts_valid_fields_and_applies_version_default() -> None:
     assert message.schema_version == "1"
     assert message.job_id == job_id
     assert message.job_type == "sum_numbers"
+    assert message.attempt_number is None
 
 
 def test_job_message_serializes_to_redis_compatible_strings_and_round_trips() -> None:
@@ -31,7 +32,7 @@ def test_job_message_serializes_to_redis_compatible_strings_and_round_trips() ->
         job_type="sum_numbers",
     )
 
-    fields = message.model_dump(mode="json")
+    fields = message.model_dump(mode="json", exclude_none=True)
     restored_message = JobMessage.model_validate(fields)
 
     assert fields == {
@@ -41,6 +42,24 @@ def test_job_message_serializes_to_redis_compatible_strings_and_round_trips() ->
     }
     assert all(isinstance(value, str) for value in fields.values())
     assert restored_message == message
+
+
+def test_job_message_accepts_current_attempt_number() -> None:
+    message = JobMessage(job_id=uuid7(), job_type="sum_numbers", attempt_number=2)
+
+    assert message.attempt_number == 2
+    assert (
+        JobMessage.model_validate(message.model_dump(mode="json", exclude_none=True))
+        == message
+    )
+
+
+@pytest.mark.parametrize("attempt_number", [0, -1])
+def test_job_message_rejects_invalid_attempt_number(attempt_number: int) -> None:
+    with pytest.raises(ValidationError):
+        JobMessage(
+            job_id=uuid7(), job_type="sum_numbers", attempt_number=attempt_number
+        )
 
 
 def test_job_message_rejects_invalid_job_id() -> None:

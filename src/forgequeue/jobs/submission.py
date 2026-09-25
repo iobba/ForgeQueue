@@ -35,6 +35,7 @@ class JobSubmissionService:
             JobMessage(
                 job_id=job.id,
                 job_type=job.job_type,
+                attempt_number=1,
             )
         )
         return job

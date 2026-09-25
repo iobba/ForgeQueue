@@ -15,6 +15,7 @@ class JobMessage(BaseModel):
     schema_version: Literal["1"] = "1"
     job_id: UUID
     job_type: str = Field(min_length=1, max_length=100)
+    attempt_number: int | None = Field(default=None, ge=1)
 
 
 class DeadLetterReason(StrEnum):

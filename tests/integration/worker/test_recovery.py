@@ -26,6 +26,7 @@ from forgequeue.jobs.leases import AttemptLease, AttemptLeasePolicy
 from forgequeue.jobs.repository import JobRepository
 from forgequeue.jobs.service import JobService
 from forgequeue.jobs.status import JobStatus
+from forgequeue.scheduler.retry_dispatcher import RetryDispatcher
 from forgequeue.worker.processor import JobProcessor
 from forgequeue.worker.recovery import (
     ReclaimedDeliveryAction,
@@ -35,6 +36,7 @@ from forgequeue.worker.recovery import (
     ReclaimedDeliveryReason,
     RecoveryBatchResult,
 )
+from forgequeue.worker.runner import Worker
 
 pytestmark = [
     pytest.mark.integration,
@@ -184,6 +186,104 @@ async def test_recover_one_processes_queued_job_and_acknowledges_delivery(
     assert attempts[0].worker_id == "worker-two"
     assert attempts[0].status is JobAttemptStatus.SUCCEEDED
     assert await recovery_environment.broker.list_pending() == []
+
+
+async def test_old_pending_delivery_does_not_consume_a_queued_retry(
+    recovery_environment: RecoveryTestEnvironment,
+) -> None:
+    job_id = await create_job(recovery_environment, max_attempts=2)
+    broker = recovery_environment.broker
+    await broker.ensure_consumer_group()
+    original_entry_id = await broker.publish(
+        JobMessage(job_id=job_id, job_type="sum_numbers", attempt_number=1)
+    )
+    assert len(await broker.read(consumer_name="worker-one", block_ms=None)) == 1
+
+    started_at = datetime.now(UTC) - timedelta(minutes=2)
+    lease = AttemptLeasePolicy().issue(heartbeat_at=started_at)
+    failure = RetryableJobError(
+        error_code="dependency_unavailable",
+        safe_message="A dependency is temporarily unavailable",
+    )
+    async with recovery_environment.session_factory.begin() as session:
+        service = JobService(JobRepository(session))
+        await service.start_job(job_id, started_at=started_at)
+        attempt_service = JobAttemptService(JobAttemptRepository(session))
+        attempt = await attempt_service.start_attempt(
+            job_id=job_id,
+            attempt_number=1,
+            worker_id="worker-one",
+            lease=lease,
+        )
+        await attempt_service.fail_owned_attempt(
+            attempt.id,
+            failure,
+            worker_id="worker-one",
+            current_lease=lease,
+            completed_at=started_at + timedelta(seconds=1),
+        )
+        await service.schedule_retry(
+            job_id,
+            error=failure,
+            delay=timedelta(seconds=1),
+            scheduled_at=started_at + timedelta(seconds=1),
+        )
+
+    dispatcher = RetryDispatcher(
+        broker,
+        recovery_environment.session_factory,
+        clock=lambda: started_at + timedelta(seconds=2),
+    )
+    assert await dispatcher.run_once() == 1
+
+    recovery_batch = await recovery_environment.coordinator.recover_batch(
+        worker_id="worker-two",
+        min_idle_ms=0,
+        start_id="0-0",
+        count=1,
+    )
+    assert recovery_batch.outcomes == [
+        ReclaimedDeliveryOutcome(
+            entry_id=original_entry_id,
+            decision=ReclaimedDeliveryDecision(
+                action=ReclaimedDeliveryAction.ACKNOWLEDGE,
+                reason=ReclaimedDeliveryReason.STALE_ATTEMPT,
+            ),
+        )
+    ]
+    assert await broker.list_pending() == []
+
+    async with recovery_environment.session_factory() as session:
+        queued_job = await JobRepository(session).get(job_id)
+    assert queued_job is not None
+    assert queued_job.status is JobStatus.QUEUED
+    assert queued_job.attempts == 1
+
+    worker = Worker(
+        broker,
+        JobProcessor(
+            broker,
+            RedisDeadLetterBroker(
+                recovery_environment.redis_client,
+                stream_name=recovery_environment.dead_letter_stream_name,
+            ),
+            recovery_environment.session_factory,
+        ),
+        worker_id="worker-two",
+    )
+    assert await worker.run_once(block_ms=None) is True
+
+    async with recovery_environment.session_factory() as session:
+        completed_job = await JobRepository(session).get(job_id)
+        attempts = await JobAttemptRepository(session).list_for_job(job_id)
+    assert completed_job is not None
+    assert completed_job.status is JobStatus.COMPLETED
+    assert completed_job.attempts == 2
+    assert [attempt.status for attempt in attempts] == [
+        JobAttemptStatus.FAILED,
+        JobAttemptStatus.SUCCEEDED,
+    ]
+    assert await broker.list_pending() == []
 
 
 @pytest.mark.parametrize("terminal_status", [JobStatus.COMPLETED, JobStatus.FAILED])
