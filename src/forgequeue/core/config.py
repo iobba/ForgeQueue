@@ -50,6 +50,11 @@ class Settings(BaseSettings):
         gt=0,
         allow_inf_nan=False,
     )
+    worker_handler_timeout_seconds: float = Field(
+        default=300.0,
+        gt=0,
+        allow_inf_nan=False,
+    )
 
     retry_dispatcher_batch_size: int = Field(default=100, ge=1, le=1_000)
     retry_dispatcher_poll_seconds: float = Field(

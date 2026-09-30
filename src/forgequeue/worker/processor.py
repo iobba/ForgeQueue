@@ -2,11 +2,11 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from math import isfinite
 from random import random
 from uuid import UUID
 
 import structlog
-from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from forgequeue.broker.messages import (
@@ -20,25 +20,23 @@ from forgequeue.broker.redis import RedisDeadLetterBroker, RedisJobBroker
 from forgequeue.jobs.attempt_repository import JobAttemptRepository
 from forgequeue.jobs.attempt_service import JobAttemptService
 from forgequeue.jobs.attempts import JobFailureKind
-from forgequeue.jobs.execution_errors import (
-    JobExecutionError,
-    PermanentJobError,
-    RetryableJobError,
-)
+from forgequeue.jobs.execution_errors import JobExecutionError, RetryableJobError
 from forgequeue.jobs.leases import AttemptLease, AttemptLeasePolicy
 from forgequeue.jobs.repository import JobRepository
 from forgequeue.jobs.retry_policy import RetryPolicy
 from forgequeue.jobs.service import JobService
-from forgequeue.worker.handlers import (
-    JobHandler,
-    JobResult,
-    UnsupportedJobTypeError,
-    get_handler,
+from forgequeue.worker.child_protocol import HandlerRequest, HandlerResponse
+from forgequeue.worker.executor import (
+    HandlerExecutor,
+    HandlerSubprocessExecutor,
+    HandlerTimedOut,
 )
+from forgequeue.worker.handlers import JobResult
 
 INVALID_JOB_PAYLOAD_ERROR_CODE = "invalid_job_payload"
 UNSUPPORTED_JOB_TYPE_ERROR_CODE = "unsupported_job_type"
 WORKER_LEASE_EXPIRED_ERROR_CODE = "worker_lease_expired"
+HANDLER_TIMEOUT_ERROR_CODE = "handler_timeout"
 
 logger = structlog.get_logger(__name__)
 
@@ -80,14 +78,20 @@ class JobProcessor:
         *,
         retry_policy: RetryPolicy | None = None,
         lease_policy: AttemptLeasePolicy | None = None,
+        executor: HandlerExecutor | None = None,
+        handler_timeout_seconds: float = 300.0,
         jitter_source: Callable[[], float] = random,
         clock: Callable[[], datetime] = utc_now,
     ) -> None:
+        if not isfinite(handler_timeout_seconds) or handler_timeout_seconds <= 0:
+            raise ValueError("handler_timeout_seconds must be finite and positive")
         self._broker = broker
         self._dead_letter_broker = dead_letter_broker
         self._session_factory = session_factory
         self._retry_policy = retry_policy or RetryPolicy()
         self._lease_policy = lease_policy or AttemptLeasePolicy()
+        self._executor = executor or HandlerSubprocessExecutor()
+        self._handler_timeout_seconds = handler_timeout_seconds
         self._jitter_source = jitter_source
         self._clock = clock
 
@@ -132,9 +136,8 @@ class JobProcessor:
         logger.info("job_processing_started")
 
         try:
-            handler = get_handler(job_type)
             execution = await self._run_handler_with_heartbeats(
-                handler,
+                job_type,
                 payload,
                 attempt_id=attempt_id,
                 worker_id=worker_id,
@@ -146,17 +149,10 @@ class JobProcessor:
             result = execution.result
             if result is None:
                 raise RuntimeError("Job handler returned no result")
-        except UnsupportedJobTypeError as exc:
-            error = PermanentJobError(
-                error_code=UNSUPPORTED_JOB_TYPE_ERROR_CODE,
-                safe_message=(
-                    f"No handler is registered for job type {exc.job_type!r}"
-                ),
-            )
-        except ValidationError:
-            error = PermanentJobError(
-                error_code=INVALID_JOB_PAYLOAD_ERROR_CODE,
-                safe_message="Stored job payload failed validation",
+        except HandlerTimedOut:
+            error = RetryableJobError(
+                error_code=HANDLER_TIMEOUT_ERROR_CODE,
+                safe_message="Handler exceeded its execution deadline",
             )
         except JobExecutionError as exc:
             error = exc
@@ -212,14 +208,20 @@ class JobProcessor:
 
     async def _run_handler_with_heartbeats(
         self,
-        handler: JobHandler,
+        job_type: str,
         payload: dict[str, object],
         *,
         attempt_id: UUID,
         worker_id: str,
         lease: AttemptLease,
     ) -> HandlerExecution:
-        handler_task = asyncio.create_task(asyncio.to_thread(handler, payload))
+        request = HandlerRequest(job_type=job_type, payload=payload)
+        handler_task = asyncio.create_task(
+            self._executor.execute(
+                request,
+                timeout_seconds=self._handler_timeout_seconds,
+            )
+        )
         current_lease = lease
         heartbeat_interval = self._lease_policy.heartbeat_interval.total_seconds()
 
@@ -231,10 +233,10 @@ class JobProcessor:
                 )
                 if handler_task in completed:
                     try:
-                        result = await handler_task
+                        response = await handler_task
                     except Exception as exc:
                         return HandlerExecution(lease=current_lease, error=exc)
-                    return HandlerExecution(lease=current_lease, result=result)
+                    return self._execution_from_response(response, current_lease)
 
                 heartbeat_at = self._clock()
                 async with self._session_factory.begin() as session:
@@ -256,6 +258,27 @@ class JobProcessor:
             if not handler_task.done():
                 handler_task.cancel()
                 await asyncio.gather(handler_task, return_exceptions=True)
+
+    @staticmethod
+    def _execution_from_response(
+        response: HandlerResponse,
+        lease: AttemptLease,
+    ) -> HandlerExecution:
+        if response.status == "succeeded":
+            assert response.result is not None
+            return HandlerExecution(lease=lease, result=response.result)
+
+        assert response.failure_kind is not None
+        assert response.error_code is not None
+        assert response.safe_message is not None
+        return HandlerExecution(
+            lease=lease,
+            error=JobExecutionError(
+                failure_kind=response.failure_kind,
+                error_code=response.error_code,
+                safe_message=response.safe_message,
+            ),
+        )
 
     async def _persist_failure(
         self,

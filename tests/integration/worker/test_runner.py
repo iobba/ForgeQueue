@@ -11,7 +11,6 @@ from redis.typing import EncodableT, FieldT
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-import forgequeue.worker.processor as processor_module
 from forgequeue.broker.messages import JobMessage
 from forgequeue.broker.redis import RedisDeadLetterBroker, RedisJobBroker
 from forgequeue.db.models import Job
@@ -22,7 +21,7 @@ from forgequeue.jobs.repository import JobRepository
 from forgequeue.jobs.service import JobService
 from forgequeue.jobs.status import JobStatus
 from forgequeue.jobs.submission import JobSubmissionService
-from forgequeue.worker.handlers import JobHandler
+from forgequeue.worker.child_protocol import HandlerRequest, HandlerResponse
 from forgequeue.worker.processor import JobProcessor
 from forgequeue.worker.runner import Worker
 
@@ -137,7 +136,6 @@ async def test_two_workers_share_deliveries_from_one_consumer_group(
 async def test_shutdown_finishes_in_flight_job_and_skips_new_delivery(
     redis_client: Redis,
     database_session_factory: async_sessionmaker[AsyncSession],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     stream_name = f"forgequeue:test:shutdown:{uuid7()}"
     dead_letter_stream_name = f"forgequeue:test:shutdown:dead:{uuid7()}"
@@ -146,16 +144,6 @@ async def test_shutdown_finishes_in_flight_job_and_skips_new_delivery(
         stream_name=stream_name,
         group_name="forgequeue-test-workers",
     )
-    processor = JobProcessor(
-        broker,
-        RedisDeadLetterBroker(redis_client, stream_name=dead_letter_stream_name),
-        database_session_factory,
-        lease_policy=AttemptLeasePolicy(
-            duration=timedelta(seconds=5),
-            heartbeat_interval=timedelta(milliseconds=100),
-        ),
-    )
-    worker = Worker(broker, processor, worker_id="worker-shutdown-test")
     stop_event = asyncio.Event()
     handler_started = asyncio.Event()
     release_handler = Event()
@@ -168,11 +156,29 @@ async def test_shutdown_finishes_in_flight_job_and_skips_new_delivery(
             raise RuntimeError("Test handler was not released")
         return {"sum": sum(cast(list[int], payload["numbers"]))}
 
-    def get_test_handler(job_type: str) -> JobHandler:
-        assert job_type == "sum_numbers"
-        return held_handler
+    class HeldHandlerExecutor:
+        async def execute(
+            self,
+            request: HandlerRequest,
+            *,
+            timeout_seconds: float,
+        ) -> HandlerResponse:
+            del timeout_seconds
+            assert request.job_type == "sum_numbers"
+            result = await asyncio.to_thread(held_handler, request.payload)
+            return HandlerResponse(status="succeeded", result=result)
 
-    monkeypatch.setattr(processor_module, "get_handler", get_test_handler)
+    processor = JobProcessor(
+        broker,
+        RedisDeadLetterBroker(redis_client, stream_name=dead_letter_stream_name),
+        database_session_factory,
+        lease_policy=AttemptLeasePolicy(
+            duration=timedelta(seconds=5),
+            heartbeat_interval=timedelta(milliseconds=100),
+        ),
+        executor=HeldHandlerExecutor(),
+    )
+    worker = Worker(broker, processor, worker_id="worker-shutdown-test")
 
     try:
         submission = JobSubmissionService(database_session_factory, broker)

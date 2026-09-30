@@ -7,18 +7,16 @@ from redis.asyncio import Redis
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-import forgequeue.worker.processor as processor_module
 from forgequeue.broker.redis import RedisDeadLetterBroker, RedisJobBroker
 from forgequeue.db.models import Job
 from forgequeue.jobs.attempt_repository import JobAttemptRepository
 from forgequeue.jobs.attempts import JobAttemptStatus, JobFailureKind
-from forgequeue.jobs.execution_errors import RetryableJobError
 from forgequeue.jobs.repository import JobRepository
 from forgequeue.jobs.retry_policy import RetryPolicy
 from forgequeue.jobs.status import JobStatus
 from forgequeue.jobs.submission import JobSubmissionService
 from forgequeue.scheduler.retry_dispatcher import RetryDispatcher
-from forgequeue.worker.handlers import JobHandler
+from forgequeue.worker.child_protocol import HandlerRequest, HandlerResponse
 from forgequeue.worker.processor import JobProcessor
 
 pytestmark = [
@@ -30,7 +28,6 @@ pytestmark = [
 async def test_retryable_job_is_dispatched_again_and_succeeds(
     redis_client: Redis,
     database_session_factory: async_sessionmaker[AsyncSession],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scheduled_at = datetime(2026, 9, 10, 12, 0, tzinfo=UTC)
     stream_name = f"forgequeue:test:retry-flow:{uuid7()}"
@@ -40,6 +37,32 @@ async def test_retryable_job_is_dispatched_again_and_succeeds(
         stream_name=stream_name,
         group_name="forgequeue-test-workers",
     )
+
+    class FailOnceExecutor:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def execute(
+            self,
+            request: HandlerRequest,
+            *,
+            timeout_seconds: float,
+        ) -> HandlerResponse:
+            del timeout_seconds
+            self.calls += 1
+            if self.calls == 1:
+                return HandlerResponse(
+                    status="failed",
+                    failure_kind=JobFailureKind.RETRYABLE,
+                    error_code="dependency_unavailable",
+                    safe_message="A dependency is temporarily unavailable",
+                )
+            return HandlerResponse(
+                status="succeeded",
+                result={"sum": sum(cast(list[int], request.payload["numbers"]))},
+            )
+
+    executor = FailOnceExecutor()
     processor = JobProcessor(
         broker,
         RedisDeadLetterBroker(
@@ -53,30 +76,14 @@ async def test_retryable_job_is_dispatched_again_and_succeeds(
         ),
         jitter_source=lambda: 1.0,
         clock=lambda: scheduled_at,
+        executor=executor,
     )
     dispatcher = RetryDispatcher(
         broker,
         database_session_factory,
         clock=lambda: scheduled_at.replace(second=5),
     )
-    handler_calls = 0
     job_id = None
-
-    def fail_once_then_succeed(payload: dict[str, object]) -> dict[str, object]:
-        nonlocal handler_calls
-        handler_calls += 1
-        if handler_calls == 1:
-            raise RetryableJobError(
-                error_code="dependency_unavailable",
-                safe_message="A dependency is temporarily unavailable",
-            )
-        return {"sum": sum(cast(list[int], payload["numbers"]))}
-
-    def get_test_handler(job_type: str) -> JobHandler:
-        del job_type
-        return fail_once_then_succeed
-
-    monkeypatch.setattr(processor_module, "get_handler", get_test_handler)
 
     try:
         await broker.ensure_consumer_group()
@@ -108,7 +115,7 @@ async def test_retryable_job_is_dispatched_again_and_succeeds(
             attempts = await JobAttemptRepository(session).list_for_job(job_id)
 
         assert dispatched_count == 1
-        assert handler_calls == 2
+        assert executor.calls == 2
         assert persisted_job is not None
         assert persisted_job.status is JobStatus.COMPLETED
         assert persisted_job.attempts == 2

@@ -1,5 +1,6 @@
 import asyncio
-from collections.abc import AsyncIterator
+import sys
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from threading import Event
@@ -14,7 +15,6 @@ from redis.exceptions import ResponseError
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-import forgequeue.worker.processor as processor_module
 from forgequeue.broker.messages import JobMessage
 from forgequeue.broker.redis import RedisDeadLetterBroker, RedisJobBroker
 from forgequeue.db.models import Job
@@ -24,14 +24,16 @@ from forgequeue.jobs.attempt_service import (
     AttemptLeaseRenewalRejectedError,
 )
 from forgequeue.jobs.attempts import JobAttemptStatus, JobFailureKind
-from forgequeue.jobs.execution_errors import RetryableJobError
+from forgequeue.jobs.execution_errors import JobExecutionError, RetryableJobError
 from forgequeue.jobs.leases import AttemptLease, AttemptLeasePolicy
 from forgequeue.jobs.repository import JobRepository
 from forgequeue.jobs.retry_policy import RetryPolicy
 from forgequeue.jobs.service import JobService
 from forgequeue.jobs.status import JobStatus
-from forgequeue.worker.handlers import JobHandler
+from forgequeue.worker.child_protocol import HandlerRequest, HandlerResponse
+from forgequeue.worker.executor import HandlerChildExited, HandlerSubprocessExecutor
 from forgequeue.worker.processor import (
+    HANDLER_TIMEOUT_ERROR_CODE,
     INVALID_JOB_PAYLOAD_ERROR_CODE,
     UNSUPPORTED_JOB_TYPE_ERROR_CODE,
     JobMessageMismatchError,
@@ -53,6 +55,31 @@ class ProcessorTestEnvironment:
     stream_name: str
     dead_letter_stream_name: str
     created_job_ids: set[UUID]
+
+
+class FunctionHandlerExecutor:
+    def __init__(
+        self, handler: Callable[[dict[str, object]], dict[str, object]]
+    ) -> None:
+        self._handler = handler
+
+    async def execute(
+        self,
+        request: HandlerRequest,
+        *,
+        timeout_seconds: float,
+    ) -> HandlerResponse:
+        del timeout_seconds
+        try:
+            result = await asyncio.to_thread(self._handler, request.payload)
+        except JobExecutionError as exc:
+            return HandlerResponse(
+                status="failed",
+                failure_kind=exc.failure_kind,
+                error_code=exc.error_code,
+                safe_message=exc.safe_message,
+            )
+        return HandlerResponse(status="succeeded", result=result)
 
 
 @pytest_asyncio.fixture
@@ -171,7 +198,6 @@ async def test_process_completes_job_and_acknowledges_delivery(
 
 async def test_process_renews_lease_while_handler_is_running(
     processor_environment: ProcessorTestEnvironment,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     job_id = await create_persisted_job(processor_environment)
     await processor_environment.broker.ensure_consumer_group()
@@ -188,11 +214,6 @@ async def test_process_renews_lease_while_handler_is_running(
         sleep(0.08)
         return {"sum": 60}
 
-    def get_slow_handler(job_type: str) -> JobHandler:
-        del job_type
-        return slow_handler
-
-    monkeypatch.setattr(processor_module, "get_handler", get_slow_handler)
     lease_policy = AttemptLeasePolicy(
         duration=timedelta(milliseconds=500),
         heartbeat_interval=timedelta(milliseconds=10),
@@ -205,6 +226,7 @@ async def test_process_renews_lease_while_handler_is_running(
         ),
         processor_environment.session_factory,
         lease_policy=lease_policy,
+        executor=FunctionHandlerExecutor(slow_handler),
     )
 
     await processor.process(deliveries[0], worker_id="worker-one")
@@ -262,11 +284,6 @@ async def test_process_leaves_delivery_pending_when_lease_renewal_is_rejected(
         )
         return None
 
-    def get_slow_handler(job_type: str) -> JobHandler:
-        del job_type
-        return slow_handler
-
-    monkeypatch.setattr(processor_module, "get_handler", get_slow_handler)
     monkeypatch.setattr(JobAttemptRepository, "renew_lease", reject_renewal)
     processor = JobProcessor(
         processor_environment.broker,
@@ -279,6 +296,7 @@ async def test_process_leaves_delivery_pending_when_lease_renewal_is_rejected(
             duration=timedelta(milliseconds=500),
             heartbeat_interval=timedelta(milliseconds=10),
         ),
+        executor=FunctionHandlerExecutor(slow_handler),
     )
 
     with pytest.raises(AttemptLeaseRenewalRejectedError):
@@ -471,8 +489,8 @@ async def test_process_persists_unsupported_job_type_and_acknowledges(
         assert persisted_job.attempts == 1
         assert persisted_job.result is None
         assert persisted_job.error_code == UNSUPPORTED_JOB_TYPE_ERROR_CODE
-        assert persisted_job.error_message == (
-            "No handler is registered for job type 'generate_report'"
+        assert (
+            persisted_job.error_message == "No handler is registered for this job type"
         )
         assert persisted_job.started_at is not None
         assert persisted_job.completed_at is not None
@@ -593,7 +611,6 @@ async def test_process_rolls_back_terminal_failure_when_dead_letter_publish_fail
 
 async def test_process_leaves_unexpected_handler_failure_pending(
     processor_environment: ProcessorTestEnvironment,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     job_id = await create_persisted_job(processor_environment)
     await processor_environment.broker.ensure_consumer_group()
@@ -609,14 +626,18 @@ async def test_process_leaves_unexpected_handler_failure_pending(
         del payload
         raise RuntimeError("unexpected handler bug")
 
-    def get_failing_handler(job_type: str) -> JobHandler:
-        del job_type
-        return raise_unexpected_error
-
-    monkeypatch.setattr(processor_module, "get_handler", get_failing_handler)
+    processor = JobProcessor(
+        processor_environment.broker,
+        RedisDeadLetterBroker(
+            processor_environment.redis_client,
+            stream_name=processor_environment.dead_letter_stream_name,
+        ),
+        processor_environment.session_factory,
+        executor=FunctionHandlerExecutor(raise_unexpected_error),
+    )
 
     with pytest.raises(RuntimeError, match="unexpected handler bug"):
-        await processor_environment.processor.process(
+        await processor.process(
             deliveries[0],
             worker_id="worker-one",
         )
@@ -641,9 +662,95 @@ async def test_process_leaves_unexpected_handler_failure_pending(
     ]
 
 
+async def test_process_times_out_child_and_schedules_retry(
+    processor_environment: ProcessorTestEnvironment,
+) -> None:
+    job_id = await create_persisted_job(processor_environment, max_attempts=2)
+    await processor_environment.broker.ensure_consumer_group()
+    await processor_environment.broker.publish(
+        JobMessage(job_id=job_id, job_type="sum_numbers")
+    )
+    deliveries = await processor_environment.broker.read(
+        consumer_name="worker-one",
+        block_ms=None,
+    )
+    processor = JobProcessor(
+        processor_environment.broker,
+        RedisDeadLetterBroker(
+            processor_environment.redis_client,
+            stream_name=processor_environment.dead_letter_stream_name,
+        ),
+        processor_environment.session_factory,
+        executor=HandlerSubprocessExecutor(
+            command=(sys.executable, "-c", "import time; time.sleep(10)"),
+            termination_grace_seconds=0.1,
+        ),
+        handler_timeout_seconds=0.3,
+        jitter_source=lambda: 0.5,
+    )
+
+    await processor.process(deliveries[0], worker_id="worker-one")
+
+    async with processor_environment.session_factory() as session:
+        job = await JobRepository(session).get(job_id)
+        attempts = await JobAttemptRepository(session).list_for_job(job_id)
+
+    assert job is not None
+    assert job.status is JobStatus.RETRY_SCHEDULED
+    assert job.error_code == HANDLER_TIMEOUT_ERROR_CODE
+    assert job.next_attempt_at is not None
+    assert len(attempts) == 1
+    assert attempts[0].status is JobAttemptStatus.FAILED
+    assert attempts[0].failure_kind is JobFailureKind.RETRYABLE
+    assert attempts[0].error_code == HANDLER_TIMEOUT_ERROR_CODE
+    assert await processor_environment.broker.list_pending() == []
+    assert await read_dead_letter_entries(processor_environment) == []
+
+
+async def test_process_leaves_crashed_child_delivery_pending(
+    processor_environment: ProcessorTestEnvironment,
+) -> None:
+    job_id = await create_persisted_job(processor_environment)
+    await processor_environment.broker.ensure_consumer_group()
+    await processor_environment.broker.publish(
+        JobMessage(job_id=job_id, job_type="sum_numbers")
+    )
+    deliveries = await processor_environment.broker.read(
+        consumer_name="worker-one",
+        block_ms=None,
+    )
+    processor = JobProcessor(
+        processor_environment.broker,
+        RedisDeadLetterBroker(
+            processor_environment.redis_client,
+            stream_name=processor_environment.dead_letter_stream_name,
+        ),
+        processor_environment.session_factory,
+        executor=HandlerSubprocessExecutor(
+            command=(sys.executable, "-c", "import sys; sys.exit(7)"),
+        ),
+    )
+
+    with pytest.raises(HandlerChildExited, match="code 7"):
+        await processor.process(deliveries[0], worker_id="worker-one")
+
+    async with processor_environment.session_factory() as session:
+        job = await JobRepository(session).get(job_id)
+        attempts = await JobAttemptRepository(session).list_for_job(job_id)
+
+    assert job is not None
+    assert job.status is JobStatus.RUNNING
+    assert len(attempts) == 1
+    assert attempts[0].status is JobAttemptStatus.RUNNING
+    assert [
+        pending.entry_id
+        for pending in await processor_environment.broker.list_pending()
+    ] == [deliveries[0].entry_id]
+    assert await read_dead_letter_entries(processor_environment) == []
+
+
 async def test_process_schedules_retryable_failure_with_backoff_and_acknowledges(
     processor_environment: ProcessorTestEnvironment,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scheduled_at = datetime(2026, 9, 10, 12, 0, tzinfo=UTC)
     job_id = await create_persisted_job(
@@ -666,11 +773,6 @@ async def test_process_schedules_retryable_failure_with_backoff_and_acknowledges
             safe_message="A dependency is temporarily unavailable",
         )
 
-    def get_failing_handler(job_type: str) -> JobHandler:
-        del job_type
-        return raise_retryable_error
-
-    monkeypatch.setattr(processor_module, "get_handler", get_failing_handler)
     processor = JobProcessor(
         processor_environment.broker,
         RedisDeadLetterBroker(
@@ -684,6 +786,7 @@ async def test_process_schedules_retryable_failure_with_backoff_and_acknowledges
         ),
         jitter_source=lambda: 0.5,
         clock=lambda: scheduled_at,
+        executor=FunctionHandlerExecutor(raise_retryable_error),
     )
 
     await processor.process(deliveries[0], worker_id="worker-one")
@@ -715,7 +818,6 @@ async def test_process_schedules_retryable_failure_with_backoff_and_acknowledges
 
 async def test_process_makes_exhausted_retryable_failure_terminal(
     processor_environment: ProcessorTestEnvironment,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     job_id = await create_persisted_job(
         processor_environment,
@@ -737,16 +839,11 @@ async def test_process_makes_exhausted_retryable_failure_terminal(
             safe_message="A dependency is temporarily unavailable",
         )
 
-    def get_failing_handler(job_type: str) -> JobHandler:
-        del job_type
-        return raise_retryable_error
-
     def reject_jitter_call() -> float:
         raise AssertionError(
             "Jitter must not be generated after attempts are exhausted"
         )
 
-    monkeypatch.setattr(processor_module, "get_handler", get_failing_handler)
     processor = JobProcessor(
         processor_environment.broker,
         RedisDeadLetterBroker(
@@ -755,6 +852,7 @@ async def test_process_makes_exhausted_retryable_failure_terminal(
         ),
         processor_environment.session_factory,
         jitter_source=reject_jitter_call,
+        executor=FunctionHandlerExecutor(raise_retryable_error),
     )
 
     await processor.process(deliveries[0], worker_id="worker-one")

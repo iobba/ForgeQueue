@@ -33,6 +33,10 @@ Workers renew a lease while processing each job attempt. If a worker stops
 renewing it, another worker can reclaim the pending delivery and retry or fail
 the job according to its retry policy.
 
+Handlers run in short-lived subprocesses, allowing workers to stop overdue
+execution while continuing to renew the attempt lease. A timeout is recorded
+only while the worker still owns that lease.
+
 ```text
 Client
   |

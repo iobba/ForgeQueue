@@ -29,6 +29,7 @@ def test_accepts_redis_block_time_shorter_than_socket_timeout() -> None:
     assert settings.worker_recovery_poll_seconds == 30.0
     assert settings.worker_lease_duration_seconds == 60.0
     assert settings.worker_heartbeat_interval_seconds == 15.0
+    assert settings.worker_handler_timeout_seconds == 300.0
     assert settings.retry_dispatcher_batch_size == 100
     assert settings.retry_dispatcher_poll_seconds == 1.0
 
@@ -110,6 +111,10 @@ def test_rejects_invalid_worker_recovery_settings(
         ("worker_heartbeat_interval_seconds", 0),
         ("worker_heartbeat_interval_seconds", inf),
         ("worker_heartbeat_interval_seconds", nan),
+        ("worker_handler_timeout_seconds", 0),
+        ("worker_handler_timeout_seconds", -1),
+        ("worker_handler_timeout_seconds", inf),
+        ("worker_handler_timeout_seconds", nan),
     ],
 )
 def test_rejects_invalid_worker_lease_settings(

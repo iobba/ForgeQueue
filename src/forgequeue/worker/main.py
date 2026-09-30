@@ -67,6 +67,7 @@ def create_worker(
                 seconds=settings.worker_heartbeat_interval_seconds
             ),
         ),
+        handler_timeout_seconds=settings.worker_handler_timeout_seconds,
     )
     recovery = PeriodicRecovery(
         ReclaimedDeliveryCoordinator(
