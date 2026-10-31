@@ -3,6 +3,7 @@ import sys
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from threading import Event
 from time import sleep
 from typing import cast
@@ -241,6 +242,102 @@ async def test_process_renews_lease_while_handler_is_running(
     assert attempts[0].lease_expires_at == (
         attempts[0].heartbeat_at + lease_policy.duration
     )
+    assert await processor_environment.broker.list_pending() == []
+
+
+async def test_process_renews_lease_while_real_child_is_running(
+    processor_environment: ProcessorTestEnvironment,
+    tmp_path: Path,
+) -> None:
+    job_id = await create_persisted_job(processor_environment)
+    await processor_environment.broker.ensure_consumer_group()
+    await processor_environment.broker.publish(
+        JobMessage(job_id=job_id, job_type="sum_numbers")
+    )
+    deliveries = await processor_environment.broker.read(
+        consumer_name="worker-one",
+        block_ms=None,
+    )
+    started_file = tmp_path / "child-started"
+    release_file = tmp_path / "release-child"
+    child_script = (
+        "import sys, time\n"
+        "from pathlib import Path\n"
+        "Path(sys.argv[1]).touch()\n"
+        "while not Path(sys.argv[2]).exists(): time.sleep(0.01)\n"
+        "from forgequeue.worker.child_main import main\n"
+        "main()\n"
+    )
+    lease_policy = AttemptLeasePolicy(
+        duration=timedelta(seconds=2),
+        heartbeat_interval=timedelta(milliseconds=50),
+    )
+    processor = JobProcessor(
+        processor_environment.broker,
+        RedisDeadLetterBroker(
+            processor_environment.redis_client,
+            stream_name=processor_environment.dead_letter_stream_name,
+        ),
+        processor_environment.session_factory,
+        lease_policy=lease_policy,
+        executor=HandlerSubprocessExecutor(
+            command=(
+                sys.executable,
+                "-c",
+                child_script,
+                str(started_file),
+                str(release_file),
+            ),
+        ),
+        handler_timeout_seconds=8,
+    )
+    child_ready_at: datetime | None = None
+
+    async with asyncio.TaskGroup() as group:
+        processing = group.create_task(
+            processor.process(deliveries[0], worker_id="worker-one")
+        )
+        try:
+            async with asyncio.timeout(5):
+                while True:
+                    if processing.done():
+                        await processing
+                        pytest.fail("Child finished before its lease was renewed")
+                    if started_file.exists():
+                        if child_ready_at is None:
+                            # Set this once after observing child startup. A
+                            # heartbeat from before startup cannot satisfy it,
+                            # even if that heartbeat commits after this point.
+                            child_ready_at = datetime.now(UTC)
+                        async with processor_environment.session_factory() as session:
+                            attempts = await JobAttemptRepository(session).list_for_job(
+                                job_id
+                            )
+                        if attempts:
+                            attempt = attempts[0]
+                            if (
+                                attempt.heartbeat_at is not None
+                                and attempt.heartbeat_at > child_ready_at
+                            ):
+                                assert attempt.status is JobAttemptStatus.RUNNING
+                                assert not processing.done()
+                                break
+                    await asyncio.sleep(0.02)
+        finally:
+            release_file.touch()
+
+    async with processor_environment.session_factory() as session:
+        job = await JobRepository(session).get(job_id)
+        attempts = await JobAttemptRepository(session).list_for_job(job_id)
+
+    assert job is not None
+    assert job.status is JobStatus.COMPLETED
+    assert job.result == {"sum": 60}
+    assert len(attempts) == 1
+    assert attempts[0].status is JobAttemptStatus.SUCCEEDED
+    assert attempts[0].heartbeat_at is not None
+    assert child_ready_at is not None
+    assert attempts[0].heartbeat_at > child_ready_at
     assert await processor_environment.broker.list_pending() == []
 
 

@@ -1,3 +1,4 @@
+import sys
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -20,13 +21,14 @@ from forgequeue.broker.redis import RedisDeadLetterBroker, RedisJobBroker
 from forgequeue.db.models import Job
 from forgequeue.jobs.attempt_repository import JobAttemptRepository
 from forgequeue.jobs.attempt_service import JobAttemptService
-from forgequeue.jobs.attempts import JobAttemptStatus
+from forgequeue.jobs.attempts import JobAttemptStatus, JobFailureKind
 from forgequeue.jobs.execution_errors import RetryableJobError
 from forgequeue.jobs.leases import AttemptLease, AttemptLeasePolicy
 from forgequeue.jobs.repository import JobRepository
 from forgequeue.jobs.service import JobService
 from forgequeue.jobs.status import JobStatus
 from forgequeue.scheduler.retry_dispatcher import RetryDispatcher
+from forgequeue.worker.executor import HandlerChildExited, HandlerSubprocessExecutor
 from forgequeue.worker.processor import JobProcessor
 from forgequeue.worker.recovery import (
     ReclaimedDeliveryAction,
@@ -387,6 +389,175 @@ async def test_recover_one_schedules_retry_for_expired_running_attempt(
     assert attempt.status is JobAttemptStatus.FAILED
     assert attempt.error_code == "worker_lease_expired"
     assert await recovery_environment.broker.list_pending() == []
+
+
+async def test_crashed_child_is_recovered_after_lease_expiry_and_retry_completes(
+    recovery_environment: RecoveryTestEnvironment,
+) -> None:
+    job_id = await create_job(recovery_environment, max_attempts=2)
+    broker = recovery_environment.broker
+    session_factory = recovery_environment.session_factory
+    dead_letter_broker = RedisDeadLetterBroker(
+        recovery_environment.redis_client,
+        stream_name=recovery_environment.dead_letter_stream_name,
+    )
+    # Advance application time explicitly; Redis and both child processes are real.
+    observed_at = datetime.now(UTC) - timedelta(minutes=2)
+    crashing_processor = JobProcessor(
+        broker,
+        dead_letter_broker,
+        session_factory,
+        clock=lambda: observed_at,
+        executor=HandlerSubprocessExecutor(
+            command=(
+                sys.executable,
+                "-c",
+                "import os, sys\n"
+                "from forgequeue.worker.child_protocol import "
+                "MAX_REQUEST_BYTES, decode_request\n"
+                "decode_request(sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1))\n"
+                "os._exit(7)\n",
+            ),
+        ),
+        handler_timeout_seconds=5,
+    )
+    recovery_processor = JobProcessor(
+        broker,
+        dead_letter_broker,
+        session_factory,
+        clock=lambda: observed_at,
+        jitter_source=lambda: 0.5,
+        handler_timeout_seconds=5,
+    )
+    first_worker = Worker(broker, crashing_processor, worker_id="worker-one")
+    second_worker = Worker(broker, recovery_processor, worker_id="worker-two")
+    recovery = ReclaimedDeliveryCoordinator(
+        broker,
+        recovery_processor,
+        session_factory,
+        clock=lambda: observed_at,
+    )
+    dispatcher = RetryDispatcher(
+        broker,
+        session_factory,
+        clock=lambda: observed_at,
+    )
+    await broker.ensure_consumer_group()
+    original_entry_id = await broker.publish(
+        JobMessage(job_id=job_id, job_type="sum_numbers", attempt_number=1)
+    )
+
+    with pytest.raises(HandlerChildExited) as crash:
+        await first_worker.run_once(block_ms=None)
+    assert crash.value.returncode == 7
+
+    async with session_factory() as session:
+        running_job = await JobRepository(session).get(job_id)
+        attempts = await JobAttemptRepository(session).list_for_job(job_id)
+    assert running_job is not None
+    assert running_job.status is JobStatus.RUNNING
+    assert running_job.attempts == 1
+    assert len(attempts) == 1
+    first_attempt_id = attempts[0].id
+    lease_expires_at = attempts[0].lease_expires_at
+    assert lease_expires_at is not None
+    assert attempts[0].status is JobAttemptStatus.RUNNING
+    assert attempts[0].completed_at is None
+    pending = await broker.list_pending()
+    assert [entry.entry_id for entry in pending] == [original_entry_id]
+    assert pending[0].consumer_name == "worker-one"
+
+    # Redis can transfer the delivery before the database lease allows recovery.
+    observed_at = lease_expires_at - timedelta(microseconds=1)
+    early_recovery = await recovery.recover_batch(
+        worker_id="worker-two", min_idle_ms=0, count=1
+    )
+    assert early_recovery.outcomes == [
+        ReclaimedDeliveryOutcome(
+            entry_id=original_entry_id,
+            decision=ReclaimedDeliveryDecision(
+                action=ReclaimedDeliveryAction.LEAVE_PENDING,
+                reason=ReclaimedDeliveryReason.JOB_RUNNING,
+            ),
+        )
+    ]
+    async with session_factory() as session:
+        still_running = await JobRepository(session).get(job_id)
+        untouched_attempts = await JobAttemptRepository(session).list_for_job(job_id)
+    assert still_running is not None
+    assert still_running.status is JobStatus.RUNNING
+    assert still_running.next_attempt_at is None
+    assert len(untouched_attempts) == 1
+    assert untouched_attempts[0].status is JobAttemptStatus.RUNNING
+    pending = await broker.list_pending()
+    assert [entry.entry_id for entry in pending] == [original_entry_id]
+    assert pending[0].consumer_name == "worker-two"
+
+    observed_at = lease_expires_at
+    expired_recovery = await recovery.recover_batch(
+        worker_id="worker-two", min_idle_ms=0, count=1
+    )
+    assert expired_recovery.outcomes == [
+        ReclaimedDeliveryOutcome(
+            entry_id=original_entry_id,
+            decision=ReclaimedDeliveryDecision(
+                action=ReclaimedDeliveryAction.RECOVER,
+                reason=ReclaimedDeliveryReason.JOB_LEASE_EXPIRED,
+            ),
+        )
+    ]
+    async with session_factory() as session:
+        scheduled_job = await JobRepository(session).get(job_id)
+        failed_attempt = await JobAttemptRepository(session).get(first_attempt_id)
+    assert scheduled_job is not None
+    assert scheduled_job.status is JobStatus.RETRY_SCHEDULED
+    assert scheduled_job.attempts == 1
+    next_attempt_at = scheduled_job.next_attempt_at
+    assert next_attempt_at is not None
+    assert next_attempt_at > observed_at
+    assert failed_attempt is not None
+    assert failed_attempt.status is JobAttemptStatus.FAILED
+    assert failed_attempt.failure_kind is JobFailureKind.RETRYABLE
+    assert failed_attempt.error_code == "worker_lease_expired"
+    assert failed_attempt.completed_at == lease_expires_at
+    assert await broker.list_pending() == []
+
+    observed_at = next_attempt_at - timedelta(microseconds=1)
+    assert await dispatcher.run_once() == 0
+    assert await second_worker.run_once(block_ms=None) is False
+    observed_at = next_attempt_at
+    assert await dispatcher.run_once() == 1
+    assert await second_worker.run_once(block_ms=None) is True
+
+    async with session_factory() as session:
+        completed_job = await JobRepository(session).get(job_id)
+        attempts = await JobAttemptRepository(session).list_for_job(job_id)
+    assert completed_job is not None
+    assert completed_job.status is JobStatus.COMPLETED
+    assert completed_job.attempts == 2
+    assert completed_job.result == {"sum": 60}
+    assert completed_job.error_code is None
+    assert completed_job.next_attempt_at is None
+    assert [attempt.attempt_number for attempt in attempts] == [1, 2]
+    assert [attempt.status for attempt in attempts] == [
+        JobAttemptStatus.FAILED,
+        JobAttemptStatus.SUCCEEDED,
+    ]
+    assert [attempt.worker_id for attempt in attempts] == ["worker-one", "worker-two"]
+    assert attempts[0].id == first_attempt_id
+    assert attempts[0].error_code == "worker_lease_expired"
+    assert attempts[1].completed_at is not None
+    assert await broker.list_pending() == []
+    assert (
+        await recovery_environment.redis_client.xlen(recovery_environment.stream_name)
+        == 2
+    )
+    assert (
+        await recovery_environment.redis_client.xlen(
+            recovery_environment.dead_letter_stream_name
+        )
+        == 0
+    )
 
 
 async def test_recover_one_fails_exhausted_expired_attempt_and_dead_letters(

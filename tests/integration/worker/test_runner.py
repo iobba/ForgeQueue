@@ -18,11 +18,18 @@ from forgequeue.jobs.attempt_repository import JobAttemptRepository
 from forgequeue.jobs.attempts import JobAttemptStatus
 from forgequeue.jobs.leases import AttemptLeasePolicy
 from forgequeue.jobs.repository import JobRepository
-from forgequeue.jobs.service import JobService
+from forgequeue.jobs.service import JobNotFoundError, JobService
 from forgequeue.jobs.status import JobStatus
 from forgequeue.jobs.submission import JobSubmissionService
 from forgequeue.worker.child_protocol import HandlerRequest, HandlerResponse
 from forgequeue.worker.processor import JobProcessor
+from forgequeue.worker.recovery import (
+    ReclaimedDeliveryAction,
+    ReclaimedDeliveryCoordinator,
+    ReclaimedDeliveryDecision,
+    ReclaimedDeliveryOutcome,
+    ReclaimedDeliveryReason,
+)
 from forgequeue.worker.runner import Worker
 
 pytestmark = [
@@ -353,5 +360,86 @@ async def test_worker_leaves_malformed_delivery_pending_when_quarantine_fails(
         assert [delivery.entry_id for delivery in pending_deliveries] == [
             source_entry_id
         ]
+    finally:
+        await redis_client.delete(stream_name, dead_letter_stream_name)
+
+
+async def test_worker_leaves_missing_job_pending_through_recovery(
+    redis_client: Redis,
+    database_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    stream_name = f"forgequeue:test:missing-job:{uuid7()}"
+    dead_letter_stream_name = f"forgequeue:test:missing-job:dead:{uuid7()}"
+    broker = RedisJobBroker(
+        redis_client,
+        stream_name=stream_name,
+        group_name="forgequeue-test-workers",
+    )
+    executed_requests: list[HandlerRequest] = []
+
+    class UnexpectedExecutor:
+        async def execute(
+            self,
+            request: HandlerRequest,
+            *,
+            timeout_seconds: float,
+        ) -> HandlerResponse:
+            executed_requests.append(request)
+            pytest.fail("A missing database job must never launch its handler")
+
+    processor = JobProcessor(
+        broker,
+        RedisDeadLetterBroker(redis_client, stream_name=dead_letter_stream_name),
+        database_session_factory,
+        executor=UnexpectedExecutor(),
+    )
+    worker = Worker(broker, processor, worker_id="worker-missing-job")
+    recovery = ReclaimedDeliveryCoordinator(broker, processor, database_session_factory)
+    missing_job_id = uuid7()
+
+    try:
+        await broker.ensure_consumer_group()
+        # The envelope is valid, but its authoritative PostgreSQL row is absent.
+        source_entry_id = await broker.publish(
+            JobMessage(job_id=missing_job_id, job_type="sum_numbers", attempt_number=1)
+        )
+
+        with pytest.raises(JobNotFoundError) as error:
+            await worker.run_once(block_ms=None)
+
+        assert error.value.job_id == missing_job_id
+        pending = await broker.list_pending()
+        assert [entry.entry_id for entry in pending] == [source_entry_id]
+        assert pending[0].consumer_name == worker.worker_id
+        assert await redis_client.xlen(dead_letter_stream_name) == 0
+        assert executed_requests == []
+
+        # reclaim immediately in the test, without waiting for the normal idle
+        # threshold. Recovery must preserve the delivery, not invent a job row.
+        result = await recovery.recover_batch(
+            worker_id="worker-recovery", min_idle_ms=0, count=1
+        )
+
+        assert result.outcomes == [
+            ReclaimedDeliveryOutcome(
+                entry_id=source_entry_id,
+                decision=ReclaimedDeliveryDecision(
+                    action=ReclaimedDeliveryAction.LEAVE_PENDING,
+                    reason=ReclaimedDeliveryReason.JOB_MISSING,
+                ),
+            )
+        ]
+        assert result.deleted_entry_ids == []
+        pending = await broker.list_pending()
+        assert [entry.entry_id for entry in pending] == [source_entry_id]
+        assert pending[0].consumer_name == "worker-recovery"
+        assert await redis_client.xlen(stream_name) == 1
+        assert await redis_client.xlen(dead_letter_stream_name) == 0
+        assert executed_requests == []
+        async with database_session_factory() as session:
+            assert await JobRepository(session).get(missing_job_id) is None
+            assert (
+                await JobAttemptRepository(session).list_for_job(missing_job_id) == []
+            )
     finally:
         await redis_client.delete(stream_name, dead_letter_stream_name)

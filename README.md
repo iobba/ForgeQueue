@@ -37,6 +37,11 @@ Handlers run in short-lived subprocesses, allowing workers to stop overdue
 execution while continuing to renew the attempt lease. A timeout is recorded
 only while the worker still owns that lease.
 
+Fault-injection tests cover child crashes, forced worker termination, PostgreSQL
+heartbeat connection loss, and Redis acknowledgement connection loss. Abrupt worker
+termination can still leave an active handler running; automatic parent-death
+cleanup remains planned.
+
 ```text
 Client
   |
