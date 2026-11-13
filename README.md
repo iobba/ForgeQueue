@@ -33,14 +33,16 @@ Workers renew a lease while processing each job attempt. If a worker stops
 renewing it, another worker can reclaim the pending delivery and retry or fail
 the job according to its retry policy.
 
-Handlers run in short-lived subprocesses, allowing workers to stop overdue
-execution while continuing to renew the attempt lease. A timeout is recorded
-only while the worker still owns that lease.
+Each handler runs in a short-lived subprocess managed by a dedicated supervisor.
+Worker death closes a lifeline pipe, prompting the supervisor to terminate and
+reap the handler. A timeout is recorded only after cleanup is confirmed and while
+the worker still owns the attempt lease.
 
-Fault-injection tests cover child crashes, forced worker termination, PostgreSQL
-heartbeat connection loss, and Redis acknowledgement connection loss. Abrupt worker
-termination can still leave an active handler running; automatic parent-death
-cleanup remains planned.
+Fault-injection tests cover child crashes, worker death before and during handler
+launch, active execution, incomplete input, PostgreSQL heartbeat connection loss,
+and Redis acknowledgement connection loss. Cleanup assumes a responsive supervisor
+and OS; it cannot undo external effects. Database/broker atomicity and broader
+idempotency remain future work.
 
 ```text
 Client
@@ -75,6 +77,7 @@ Streams version is mature.
 
 Prerequisites:
 
+- macOS or Linux to run the worker (handler supervision uses POSIX pipes and signals);
 - Docker with Compose support;
 - `uv`;
 - Python is installed automatically by `uv` from `.python-version` when needed.

@@ -1,4 +1,4 @@
-"""Characterize the current orphan-child limitation, not the desired contract."""
+"""Kill only the worker: prevent handler launch or stop and reap its handler."""
 
 import asyncio
 import os
@@ -6,6 +6,7 @@ import signal
 import sys
 from contextlib import suppress
 from pathlib import Path
+from typing import Literal
 from uuid import UUID, uuid7
 
 import pytest
@@ -20,6 +21,7 @@ from forgequeue.jobs.attempts import JobAttemptStatus
 from forgequeue.jobs.repository import JobRepository
 from forgequeue.jobs.status import JobStatus
 from forgequeue.jobs.submission import JobSubmissionService
+from forgequeue.worker.supervisor_protocol import decode_status
 
 pytestmark = [
     pytest.mark.integration,
@@ -30,10 +32,14 @@ pytestmark = [
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
-async def test_sigkilled_worker_currently_leaves_active_handler_running(
+@pytest.mark.parametrize(
+    "worker_stage", ["active", "before-launch", "during-launch", "input-wait"]
+)
+async def test_sigkilled_worker_leaves_no_active_handler_but_delivery_pending(
     redis_client: Redis,
     database_session_factory: async_sessionmaker[AsyncSession],
     tmp_path: Path,
+    worker_stage: Literal["active", "before-launch", "during-launch", "input-wait"],
 ) -> None:
     stream_name = f"forgequeue:test:parent-death:{uuid7()}"
     dead_letter_stream_name = f"forgequeue:test:parent-death:dead:{uuid7()}"
@@ -42,10 +48,12 @@ async def test_sigkilled_worker_currently_leaves_active_handler_running(
         redis_client, stream_name=stream_name, group_name=group_name
     )
     ready_file = tmp_path / "handler-ready"
-    probe_file = tmp_path / "continue-after-parent-death"
-    proof_file = tmp_path / "handler-continued"
+    gated_launch = worker_stage in ("before-launch", "during-launch")
+    checkpoint = (
+        ready_file.with_suffix(".supervisor-ready") if gated_launch else ready_file
+    )
     worker_process: asyncio.subprocess.Process | None = None
-    child_pid: int | None = None
+    attempt_group: int | None = None
     job_id: UUID | None = None
 
     try:
@@ -57,10 +65,8 @@ async def test_sigkilled_worker_currently_leaves_active_handler_running(
         worker_process = await asyncio.create_subprocess_exec(
             sys.executable,
             str(PROJECT_ROOT / "tests" / "helpers" / "active_handler_worker.py"),
-            "worker",
+            f"worker-{worker_stage}" if worker_stage != "active" else "worker",
             str(ready_file),
-            str(probe_file),
-            str(proof_file),
             cwd=PROJECT_ROOT,
             env={
                 **os.environ,
@@ -73,19 +79,23 @@ async def test_sigkilled_worker_currently_leaves_active_handler_running(
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
-            # A dedicated group lets finally stop descendants even if a failure
-            # happens before their PID checkpoint is read. This is test-only.
+            # Isolate the worker; the executor creates a separate attempt group.
             start_new_session=True,
         )
         async with asyncio.timeout(10):
-            while not ready_file.exists():
+            while not checkpoint.exists():
                 if worker_process.returncode is not None:
-                    pytest.fail("Worker exited before its handler became ready")
+                    pytest.fail("Worker exited before the parent-death checkpoint")
                 await asyncio.sleep(0.01)
-        child_pid, parent_pid = map(int, ready_file.read_text().split())
-        assert parent_pid == worker_process.pid
-        assert os.getpgid(child_pid) == worker_process.pid
-        assert not proof_file.exists()
+        checkpoint_pid, parent_pid = map(int, checkpoint.read_text().split())
+        supervisor_pid = checkpoint_pid if gated_launch else parent_pid
+        attempt_group = supervisor_pid
+        assert supervisor_pid not in (worker_process.pid, os.getpgrp())
+        assert os.getpgid(checkpoint_pid) == os.getsid(supervisor_pid) == supervisor_pid
+        if gated_launch:
+            assert parent_pid == worker_process.pid
+            assert not ready_file.exists()
+            assert not ready_file.with_suffix(".launched-child").exists()
 
         async with database_session_factory() as session:
             running_job = await JobRepository(session).get(job_id)
@@ -100,6 +110,11 @@ async def test_sigkilled_worker_currently_leaves_active_handler_running(
         assert len(pending) == 1
         original_entry_id = pending[0].entry_id
 
+        if worker_stage == "input-wait":
+            # The child consumed only the first byte and has not finished its
+            # remaining-input read. Killing the worker will close its writer.
+            assert not ready_file.with_suffix(".input-ended").exists()
+
         # Kill only the worker here, not its process group: the test must observe
         # what the child does without any cleanup assistance from the test runner.
         worker_process.kill()
@@ -109,14 +124,49 @@ async def test_sigkilled_worker_currently_leaves_active_handler_running(
         with pytest.raises(ProcessLookupError):
             os.kill(worker_process.pid, 0)
 
-        probe_file.touch()
+        if gated_launch:
+            # Resume only after actual worker death has closed its lifeline.
+            ready_file.with_suffix(".release-supervisor").touch()
+
+        # Every observed attempt process must disappear before fallback cleanup.
         async with asyncio.timeout(5):
-            while not proof_file.exists():
-                # PID existence alone could describe a zombie. The child's new
-                # checkpoint demonstrates it actually ran after its parent died.
-                os.kill(child_pid, 0)
-                await asyncio.sleep(0.01)
-        assert int(proof_file.read_text()) == child_pid
+            for pid in {checkpoint_pid, supervisor_pid}:
+                while True:
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        break
+                    await asyncio.sleep(0.01)
+        if worker_stage != "active":
+            status = decode_status(
+                ready_file.with_suffix(".supervisor-status").read_bytes()
+            )
+            if worker_stage == "before-launch":
+                # Absence of a ready file alone would miss a briefly launched child.
+                assert status.kind == "not_started"
+                assert status.returncode is None
+                assert not ready_file.exists()
+            elif worker_stage == "during-launch":
+                child_pid, child_parent_pid = map(
+                    int, ready_file.with_suffix(".launched-child").read_text().split()
+                )
+                assert child_parent_pid == supervisor_pid
+                assert child_pid not in (
+                    supervisor_pid,
+                    worker_process.pid,
+                    os.getpid(),
+                )
+                assert status.kind == "stopped"
+                assert status.returncode == -signal.SIGTERM
+                # Check the actual spawned PID: a dead supervisor alone would
+                # not prove that it stopped and reaped its newly launched child.
+                with pytest.raises(ProcessLookupError):
+                    os.kill(child_pid, 0)
+            else:
+                assert ready_file.with_suffix(".input-ended").read_text() == "0"
+                assert status.kind == "stopped"
+                assert status.returncode == -signal.SIGKILL
+        attempt_group = None
 
         async with database_session_factory() as session:
             abandoned_job = await JobRepository(session).get(job_id)
@@ -139,18 +189,13 @@ async def test_sigkilled_worker_currently_leaves_active_handler_running(
     finally:
         try:
             if worker_process is not None:
-                # Stop the isolated test group, including the orphaned handler.
-                with suppress(ProcessLookupError):
-                    os.killpg(worker_process.pid, signal.SIGKILL)
+                if worker_process.returncode is None:
+                    with suppress(ProcessLookupError):
+                        worker_process.kill()
                 await asyncio.wait_for(worker_process.wait(), timeout=5)
-                if child_pid is not None:
-                    async with asyncio.timeout(5):
-                        while True:
-                            try:
-                                os.kill(child_pid, 0)
-                            except ProcessLookupError:
-                                break
-                            await asyncio.sleep(0.01)
+                if attempt_group is not None:
+                    with suppress(ProcessLookupError):
+                        os.killpg(attempt_group, signal.SIGKILL)
         finally:
             try:
                 await redis_client.delete(stream_name, dead_letter_stream_name)
